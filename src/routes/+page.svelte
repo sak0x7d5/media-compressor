@@ -32,6 +32,7 @@
 		type EncodeSettings,
 		type FfmpegStatus,
 		type InstallProgress,
+		type OutputMode,
 		type PresetFile,
 		type PreviewPair
 	} from '$lib/ipc';
@@ -59,6 +60,11 @@
 
 	let showSettings = $state(false);
 	let shellMenu = $state(false);
+
+	/* Where results go. "beside" writes next to the original, which is the
+	   default and needs no folder at all. */
+	let outputMode = $state<OutputMode>('beside');
+	let outputDir = $state<string | null>(null);
 	let preview = $state<PreviewPair | null>(null);
 	let previewBusy = $state(false);
 
@@ -79,6 +85,18 @@
 	const settings = $derived<EncodeSettings>({ ...options, target_bytes: limitBytes });
 	const soleResult = $derived(jobs.soleResult);
 
+	/* A finished row can be opened to get the same result card a single file
+	   gets. Only finished jobs have a result to show, and the selection is
+	   dropped the moment that job stops existing. */
+	let openJobId = $state<string | null>(null);
+	const selectedJob = $derived(
+		openJobId
+			? jobs.jobs.find((job) => job.id === openJobId && job.state === 'done')
+			: undefined
+	);
+	const detailJob = $derived(selectedJob ?? soleResult);
+	const canGoBack = $derived(Boolean(selectedJob) && jobs.jobs.length > 1);
+
 	function flash(message: string) {
 		toast = message;
 		clearTimeout(toastTimer);
@@ -90,6 +108,20 @@
 		return MEDIA_EXTENSIONS.includes(extension);
 	}
 
+	/**
+	 * The folder for this batch, asking first when that is the chosen mode.
+	 * Returns undefined when the user cancels, which must abort the whole add
+	 * rather than silently falling back to writing beside the originals.
+	 */
+	async function resolveOutputDir(): Promise<string | null | undefined> {
+		if (outputMode === 'beside') return null;
+		if (outputMode === 'folder') return outputDir;
+
+		const chosen = await open({ directory: true, title: 'Save compressed files to' });
+		if (!chosen) return undefined;
+		return Array.isArray(chosen) ? chosen[0] : chosen;
+	}
+
 	async function enqueue(paths: string[]) {
 		const media = paths.filter(looksLikeMedia);
 		if (media.length === 0) {
@@ -97,9 +129,13 @@
 			return;
 		}
 
+		const dir = await resolveOutputDir();
+		if (dir === undefined) return;
+
 		preview = null;
+		openJobId = null;
 		try {
-			jobs.add(await addFiles(media, settings));
+			jobs.add(await addFiles(media, { ...settings, output_dir: dir }));
 		} catch (error) {
 			flash(String(error));
 		}
@@ -239,13 +275,23 @@
 			</button>
 		</header>
 
-		<section class="body" class:empty={jobs.jobs.length === 0 && !showSettings}>
+		<section
+			class="body"
+			class:empty={jobs.jobs.length === 0 && !showSettings}
+			class:fill={Boolean(preview) && !showSettings}
+		>
 			{#if showSettings}
 				<Settings
 					settings={{ ...options, target_bytes: limitBytes }}
 					{status}
 					{shellMenu}
 					presetsSourceUrl={presets?.source_url ?? ''}
+					{outputMode}
+					{outputDir}
+					onOutput={(mode, dir) => {
+						outputMode = mode;
+						outputDir = dir;
+					}}
 					onChange={(patch) => (options = { ...options, ...patch })}
 					onShellMenu={(enabled) => (shellMenu = enabled)}
 					onPresets={(next) => (presets = next)}
@@ -253,25 +299,34 @@
 				/>
 			{:else if preview}
 				<ComparePreview pair={preview} onClose={() => (preview = null)} />
-			{:else if jobs.jobs.length === 0}
-				<DropZone {hovering} onBrowse={browse} />
-			{:else if soleResult}
+			{:else if detailJob}
 				<ResultCard
-					job={soleResult}
+					job={detailJob}
 					{limitBytes}
 					busy={previewBusy}
 					onCopy={copy}
 					onReveal={(path) => void revealInFolder(path)}
-					onCompare={() => compare(soleResult.input, soleResult.output)}
-					onClear={() => jobs.remove(soleResult.id)}
+					onCompare={() => compare(detailJob.input, detailJob.output)}
+					onClear={() => {
+						jobs.remove(detailJob.id);
+						openJobId = null;
+					}}
+					onBack={canGoBack ? () => (openJobId = null) : null}
 				/>
+			{:else if jobs.jobs.length === 0}
+				<DropZone {hovering} onBrowse={browse} />
 			{:else}
 				<div class="list">
 					{#each jobs.jobs as job (job.id)}
 						<FileRow
 							{job}
 							onCancel={(id) => void cancelJob(id)}
-							onRemove={(id) => jobs.remove(id)}
+							onRemove={(id) => {
+								jobs.remove(id);
+								if (openJobId === id) openJobId = null;
+							}}
+							onSelect={(id) => (openJobId = id)}
+							onCopy={copy}
 						/>
 					{/each}
 				</div>
@@ -364,6 +419,13 @@
 
 	.body.empty {
 		padding: 14px;
+	}
+
+	/* The comparison sizes itself to the pane, so the pane must stop scrolling
+	   and hand over its height instead. */
+	.body.fill {
+		display: flex;
+		overflow: hidden;
 	}
 
 	.list {

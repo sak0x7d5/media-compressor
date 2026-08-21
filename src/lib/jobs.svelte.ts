@@ -55,6 +55,39 @@ export function describePlan(plan: EncodePlan, info?: MediaInfo): string {
 	return parts.join(' · ');
 }
 
+/** Output geometry, marking a downscale compactly: "1080->480p30". */
+function geometry(plan: EncodePlan, info?: MediaInfo): string {
+	const fps = formatFps(plan.scale.fps);
+	const rescaled =
+		info && (info.width !== plan.scale.width || info.height !== plan.scale.height);
+	return rescaled
+		? `${info.height}→${plan.scale.height}p${fps}`
+		: `${plan.scale.height}p${fps}`;
+}
+
+/**
+ * The finished-row summary: "312 MB → 19.2 MB · 1080→480p30 · h264 · 2-pass".
+ *
+ * Sizes lead because that is the answer. The bitrate that used to sit here is
+ * an encoder detail — it never told you whether the file was usable.
+ */
+export function describeResult(inputBytes: number, outcome: MediaOutcome): string {
+	const size = `${formatBytes(inputBytes)} → ${formatBytes(outcome.output_bytes)}`;
+
+	if (outcome.kind === 'image') {
+		return [size, `${outcome.width}×${outcome.height}`, `quality ${outcome.quality}`].join(' · ');
+	}
+
+	const rate =
+		outcome.plan.rate_control.mode === 'two-pass'
+			? '2-pass'
+			: `crf ${outcome.plan.rate_control.crf}`;
+
+	return [size, geometry(outcome.plan, outcome.info), CODEC_LABEL[outcome.plan.codec], rate].join(
+		' · '
+	);
+}
+
 /** "1440×810 · webp · quality 74 · 6 encodes" — what the search settled on. */
 export function describeImage(outcome: Extract<MediaOutcome, { kind: 'image' }>): string {
 	const parts = [`${outcome.width}×${outcome.height}`, `quality ${outcome.quality}`];
@@ -165,10 +198,7 @@ export class JobList {
 				job.fraction = 1;
 				job.outcome = event.outcome;
 				job.output = event.output;
-				job.detail =
-					event.outcome.kind === 'video'
-						? describePlan(event.outcome.plan, event.outcome.info)
-						: describeImage(event.outcome);
+				job.detail = describeResult(job.inputBytes, event.outcome);
 				break;
 			}
 
