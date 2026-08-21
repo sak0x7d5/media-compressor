@@ -1,0 +1,216 @@
+<script lang="ts">
+	import type { Job } from '$lib/jobs.svelte';
+	import { formatBytes, formatReduction } from '$lib/format';
+
+	let { job, limitBytes, busy, onCopy, onReveal, onCompare, onClear }: {
+		job: Job;
+		limitBytes: number;
+		busy: boolean;
+		onCopy: (path: string) => void;
+		onReveal: (path: string) => void;
+		onCompare: () => void;
+		onClear: () => void;
+	} = $props();
+
+	const outBytes = $derived(job.outcome?.output_bytes ?? 0);
+	const reduction = $derived(formatReduction(job.inputBytes, outBytes));
+
+	/* How much of the allowance was used. Landing just under the line is the
+	   goal — unused budget is quality that was thrown away, so a very short bar
+	   is a worse outcome than a nearly-full one, not a better one. */
+	const usedFraction = $derived(limitBytes > 0 ? Math.min(outBytes / limitBytes, 1) : 0);
+	const overLimit = $derived(job.outcome ? !job.outcome.within_limit : false);
+	const barColor = $derived(overLimit ? 'var(--danger)' : 'var(--success)');
+
+	/* Video counts re-encodes; an image counts quality probes. Both are "how
+	   many tries did this take", which is what the failure message needs. */
+	const attempts = $derived(
+		job.outcome?.kind === 'video'
+			? job.outcome.attempts
+			: job.outcome?.kind === 'image'
+				? job.outcome.encodes
+				: 0
+	);
+</script>
+
+<div class="card">
+	<div class="head">
+		<span class="tick" style:color={barColor} aria-hidden="true">{overLimit ? '!' : '✓'}</span>
+		<span class="name" title={job.output}>{job.name}</span>
+		<span class="spec">{job.detail}</span>
+	</div>
+
+	<div class="sizes">
+		<span class="before">{formatBytes(job.inputBytes)}</span>
+		<span class="arrow" aria-hidden="true">→</span>
+		<span class="after">{formatBytes(outBytes)}</span>
+		{#if reduction}
+			<span class="reduction" style:color={barColor}>{reduction}</span>
+		{/if}
+	</div>
+
+	<div class="track">
+		<div class="fill" style:width={`${Math.round(usedFraction * 100)}%`} style:background={barColor}></div>
+	</div>
+	<div class="scale">
+		<span>0</span>
+		<span>{formatBytes(limitBytes)} limit</span>
+	</div>
+
+	{#if overLimit}
+		<p class="warning">
+			Could not get under the limit after {attempts} attempts. The file is still here, but it
+			will not upload.
+		</p>
+	{/if}
+
+	<div class="actions">
+		<button class="primary" onclick={() => onCopy(job.output)}>Copy to clipboard</button>
+		<button onclick={() => onReveal(job.output)}>Show in folder</button>
+		<button onclick={onCompare} disabled={busy}>{busy ? 'Loading…' : 'Compare'}</button>
+		<button class="trailing" onclick={onClear}>Done</button>
+	</div>
+</div>
+
+<style>
+	.card {
+		background: var(--bg-row);
+		border-radius: var(--radius);
+		padding: 20px 18px;
+		margin: 6px;
+	}
+
+	.head {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin-bottom: 16px;
+		min-width: 0;
+	}
+
+	.tick {
+		font-size: 14px;
+		flex: none;
+	}
+
+	.name {
+		color: var(--text);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.spec {
+		margin-left: auto;
+		padding-left: 12px;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		white-space: nowrap;
+		flex: none;
+	}
+
+	.sizes {
+		display: flex;
+		align-items: baseline;
+		gap: 12px;
+		margin-bottom: 14px;
+		font-family: var(--font-mono);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.before {
+		font-size: 15px;
+		color: var(--text-muted);
+		text-decoration: line-through;
+	}
+
+	.arrow {
+		color: var(--text-muted);
+	}
+
+	.after {
+		font-size: 30px;
+		font-weight: 500;
+		color: var(--text);
+	}
+
+	.reduction {
+		margin-left: auto;
+		font-size: 12px;
+	}
+
+	.track {
+		height: 6px;
+		background: var(--bg-track);
+		border-radius: 3px;
+		overflow: hidden;
+		margin-bottom: 6px;
+	}
+
+	.fill {
+		height: 100%;
+		border-radius: 3px;
+		transition: width 320ms ease;
+	}
+
+	.scale {
+		display: flex;
+		justify-content: space-between;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		margin-bottom: 18px;
+	}
+
+	.warning {
+		margin: 0 0 16px;
+		font-size: 12px;
+		line-height: 1.5;
+		color: var(--danger);
+	}
+
+	.actions {
+		display: flex;
+		gap: 8px;
+	}
+
+	button {
+		border: 1px solid var(--border-strong);
+		background: none;
+		color: var(--text-secondary);
+		border-radius: 6px;
+		padding: 6px 13px;
+		font-size: 12px;
+	}
+
+	button:hover {
+		background: var(--bg-row-hover);
+		color: var(--text);
+	}
+
+	button:disabled {
+		opacity: 0.55;
+		cursor: default;
+	}
+
+	button:disabled:hover {
+		background: none;
+		color: var(--text-secondary);
+	}
+
+	button.primary {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--accent-ink);
+		font-weight: 500;
+	}
+
+	button.primary:hover {
+		filter: brightness(1.1);
+	}
+
+	button.trailing {
+		margin-left: auto;
+	}
+</style>

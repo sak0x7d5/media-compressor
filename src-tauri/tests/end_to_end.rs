@@ -1,0 +1,308 @@
+//! Real encodes against real FFmpeg.
+//!
+//! These generate their own source clips rather than checking a binary into the
+//! repo, which also means the fixtures cannot drift from what the tests assume.
+//!
+//! Skipped with a printed note when FFmpeg cannot be found, so `cargo test` on
+//! a bare machine stays green instead of failing for the wrong reason.
+
+use media_compressor_lib::ffmpeg::encode::{CancelToken, Speed};
+use media_compressor_lib::ffmpeg::probe::probe;
+use media_compressor_lib::ffmpeg::tools::FfmpegTools;
+use media_compressor_lib::images::ImageFormat;
+use media_compressor_lib::pipeline::{compress, CompressRequest, Stage};
+use media_compressor_lib::strategy::plan::{Options, RateControl};
+use media_compressor_lib::strategy::Target;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn tools() -> Option<FfmpegTools> {
+    let cache = std::env::temp_dir().join("media-compressor-nonexistent-cache");
+    let found = FfmpegTools::locate(&cache).ok()?;
+    found.verify().ok()?;
+    Some(found)
+}
+
+fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir()
+        .join("media-compressor-e2e")
+        .join(format!("{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Build a source clip that is genuinely expensive to encode, so a target of a
+/// couple of megabytes forces real decisions rather than fitting by accident.
+fn make_source(tools: &FfmpegTools, path: &Path, seconds: u32, width: u32, height: u32, fps: u32) {
+    let status = Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i"])
+        .arg(format!("testsrc2=size={width}x{height}:rate={fps}"))
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
+        .args(["-t", &seconds.to_string()])
+        .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"])
+        .args(["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k"])
+        .arg(path)
+        .status()
+        .expect("ffmpeg should run");
+
+    assert!(status.success(), "failed to build the test source");
+    assert!(path.is_file(), "test source was not written");
+}
+
+fn request(input: &Path, output: &Path, work: &Path, limit: u64) -> CompressRequest {
+    CompressRequest {
+        input: input.to_path_buf(),
+        output: output.to_path_buf(),
+        target: Target::new(limit),
+        options: Options::default(),
+        // Test runs are about correctness, not compression efficiency.
+        speed: Speed::Fast,
+        work_dir: work.to_path_buf(),
+        image_format: ImageFormat::Webp,
+        max_dimension: None,
+    }
+}
+
+#[test]
+fn a_long_clip_is_sampled_then_encoded_under_the_target() {
+    let Some(tools) = tools() else {
+        eprintln!("skipping: no ffmpeg available");
+        return;
+    };
+
+    let dir = scratch("long");
+    let input = dir.join("source.mp4");
+    let output = dir.join("out.mp4");
+
+    // Over the 20s threshold, so this exercises the sample-and-predict path.
+    make_source(&tools, &input, 25, 1280, 720, 30);
+
+    let limit = 2 * 1000 * 1000;
+    let mut stages: Vec<String> = Vec::new();
+
+    let outcome = compress(
+        &tools,
+        &request(&input, &output, &dir.join("work"), limit),
+        &CancelToken::new(),
+        |stage| {
+            let label = match stage {
+                Stage::Probing => "probing".to_string(),
+                Stage::Predicting => "predicting".to_string(),
+                Stage::Planned { .. } => "planned".to_string(),
+                Stage::Encoding(_) => "encoding".to_string(),
+                Stage::Correcting { .. } => "correcting".to_string(),
+                Stage::Searching(_) => "searching".to_string(),
+            };
+            if stages.last() != Some(&label) {
+                stages.push(label);
+            }
+        },
+    )
+    .expect("compression should succeed");
+
+    assert!(outcome.within_limit, "output was {} bytes, limit {limit}", outcome.output_bytes);
+    assert!(outcome.output_bytes <= limit, "output busted the limit");
+
+    // The real point: it should use most of the budget. Landing at 300 KB when
+    // 1.9 MB was available means quality was thrown away for nothing.
+    assert!(
+        outcome.output_bytes > limit / 2,
+        "output was only {} bytes of a {limit} byte budget — the budget was wasted",
+        outcome.output_bytes
+    );
+
+    assert!(stages.contains(&"predicting".to_string()), "a 25s clip should be sampled");
+    assert!(output.is_file(), "output file should exist");
+
+    // And it should still be a real, readable video.
+    let result = probe(&tools, &output).expect("output should probe cleanly");
+    assert!((result.duration_secs - 25.0).abs() < 1.0, "duration drifted to {}", result.duration_secs);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_short_clip_skips_prediction_and_is_encoded_directly() {
+    let Some(tools) = tools() else {
+        eprintln!("skipping: no ffmpeg available");
+        return;
+    };
+
+    let dir = scratch("short");
+    let input = dir.join("source.mp4");
+    let output = dir.join("out.mp4");
+
+    // Under the 20s threshold: sampling would cost as much as encoding.
+    make_source(&tools, &input, 8, 1280, 720, 30);
+
+    let limit = 20 * 1000 * 1000;
+    let mut sampled = false;
+
+    let outcome = compress(
+        &tools,
+        &request(&input, &output, &dir.join("work"), limit),
+        &CancelToken::new(),
+        |stage| {
+            if matches!(stage, Stage::Predicting) {
+                sampled = true;
+            }
+        },
+    )
+    .expect("compression should succeed");
+
+    assert!(!sampled, "a short clip should not be sampled");
+    assert!(outcome.within_limit);
+
+    // 8 seconds of 720p fits inside 20 MB comfortably, so this should stay on
+    // the quality-targeted path at full resolution rather than inflating to
+    // fill the cap.
+    assert!(
+        matches!(outcome.plan.rate_control, RateControl::Crf { .. }),
+        "an easy file should stay on CRF, got {:?}",
+        outcome.plan.rate_control
+    );
+    assert_eq!((outcome.plan.scale.width, outcome.plan.scale.height), (1280, 720));
+    assert!(
+        outcome.output_bytes < limit / 2,
+        "a CRF encode of an easy file should not fill the budget"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_tight_target_forces_two_pass_and_a_downscale() {
+    let Some(tools) = tools() else {
+        eprintln!("skipping: no ffmpeg available");
+        return;
+    };
+
+    let dir = scratch("tight");
+    let input = dir.join("source.mp4");
+    let output = dir.join("out.mp4");
+
+    make_source(&tools, &input, 24, 1920, 1080, 30);
+
+    // 700 KB for 24 seconds of 1080p is roughly 230 kbps: nowhere near enough
+    // to hold 1080p, so the ladder has to spend resolution.
+    let limit = 700 * 1000;
+
+    let outcome = compress(
+        &tools,
+        &request(&input, &output, &dir.join("work"), limit),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .expect("compression should succeed");
+
+    assert!(
+        matches!(outcome.plan.rate_control, RateControl::TwoPass { .. }),
+        "a tight target must use two-pass, got {:?}",
+        outcome.plan.rate_control
+    );
+    assert!(
+        outcome.plan.scale.height < 1080,
+        "expected a downscale, stayed at {}p",
+        outcome.plan.scale.height
+    );
+    assert!(
+        outcome.output_bytes <= limit,
+        "output was {} bytes against a {limit} byte limit",
+        outcome.output_bytes
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cancelling_stops_the_encode_and_leaves_no_scratch_files() {
+    let Some(tools) = tools() else {
+        eprintln!("skipping: no ffmpeg available");
+        return;
+    };
+
+    let dir = scratch("cancel");
+    let input = dir.join("source.mp4");
+    let output = dir.join("out.mp4");
+    let work = dir.join("work");
+
+    make_source(&tools, &input, 20, 1280, 720, 30);
+
+    let cancel = CancelToken::new();
+    let mut seen_progress = 0;
+
+    let result = compress(&tools, &request(&input, &output, &work, 2_000_000), &cancel, |stage| {
+        if matches!(stage, Stage::Encoding(_)) {
+            seen_progress += 1;
+            // Let it get going, then pull the plug.
+            if seen_progress >= 2 {
+                cancel.cancel();
+            }
+        }
+    });
+
+    let error = result.expect_err("a cancelled job must not report success");
+    assert!(error.is_cancellation(), "expected cancellation, got {error}");
+    assert!(!work.exists(), "the work directory should be cleaned up on cancel");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_image_is_quality_searched_down_to_the_target() {
+    use media_compressor_lib::images::{compress_image, ImageRequest};
+
+    let Some(tools) = tools() else {
+        eprintln!("skipping: no ffmpeg available");
+        return;
+    };
+
+    let dir = scratch("image");
+    let input = dir.join("source.png");
+    let output = dir.join("out.webp");
+
+    // A detailed synthetic image: a gradient alone would compress to almost
+    // nothing and the search would never have to work.
+    let status = Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i"])
+        .arg("testsrc2=size=1920x1080")
+        .args(["-frames:v", "1", "-c:v", "png"])
+        .arg(&input)
+        .status()
+        .expect("ffmpeg should run");
+    assert!(status.success());
+
+    let source_bytes = std::fs::metadata(&input).unwrap().len();
+    let target = 120 * 1000;
+    assert!(source_bytes > target, "the source must be too big for the test to mean anything");
+
+    let mut steps = 0;
+    let outcome = compress_image(
+        &tools,
+        &ImageRequest {
+            input: input.clone(),
+            output: output.clone(),
+            target_bytes: target,
+            format: ImageFormat::Webp,
+            max_dimension: None,
+        },
+        &CancelToken::new(),
+        |_| steps += 1,
+    )
+    .expect("image compression should succeed");
+
+    assert!(outcome.within_limit, "landed at {} against {target}", outcome.output_bytes);
+    assert!(outcome.output_bytes <= target);
+    assert!(steps > 1, "a binary search should take more than one probe");
+
+    // The point of searching rather than guessing: it should land near the
+    // target, not far below it.
+    assert!(
+        outcome.output_bytes > target / 2,
+        "used only {} of a {target} byte budget",
+        outcome.output_bytes
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

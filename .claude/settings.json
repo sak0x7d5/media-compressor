@@ -1,0 +1,53 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(export PATH=*)",
+      "Bash(cd *)",
+      "Bash(pwd)",
+
+      "Bash(cargo *)",
+      "Bash(rustc *)",
+      "Bash(rustup *)",
+
+      "Bash(pnpm *)",
+      "Bash(node *)",
+      "Bash(npx *)",
+
+      "Bash(ffmpeg *)",
+      "Bash(ffprobe *)",
+
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(grep *)",
+      "Bash(find *)",
+      "Bash(wc *)",
+      "Bash(which *)",
+      "Bash(echo *)",
+      "Bash(printf *)",
+      "Bash(sed -n *)",
+      "Bash(tasklist *)",
+      "Bash(du *)",
+      "Bash(stat *)",
+      "Bash(seq *)",
+
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git show*)",
+      "Bash(git branch*)",
+      "Bash(git rev-parse*)",
+      "Bash(git symbolic-ref*)",
+      "Bash(git remote -v*)",
+      "Bash(git ls-files*)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push*)",
+      "Bash(git reset --hard*)",
+      "Bash(git clean*)",
+      "Bash(sed -i *)"
+    ]
+  }
+}

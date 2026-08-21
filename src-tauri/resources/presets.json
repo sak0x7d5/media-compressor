@@ -1,0 +1,77 @@
+{
+  "$comment": [
+    "Upload limits, bundled with the app and editable in Settings.",
+    "The app may also refresh this file from a remote URL, so a platform",
+    "changing its cap does not require shipping a new release.",
+    "Sizes are decimal MB (10^6). Platforms disagree about whether they mean",
+    "MB or MiB, which is exactly why every target gets a safety margin."
+  ],
+  "version": 1,
+  "updated": "2026-08-21",
+  "presets": [
+    {
+      "id": "discord-free",
+      "group": "Discord",
+      "label": "Free",
+      "bytes": 20000000,
+      "default": true,
+      "note": "Raised from 10 MB on 13 August 2026. Was 25 MB before 2024."
+    },
+    {
+      "id": "discord-nitro-basic",
+      "group": "Discord",
+      "label": "Nitro Basic",
+      "bytes": 50000000
+    },
+    {
+      "id": "discord-nitro",
+      "group": "Discord",
+      "label": "Nitro",
+      "bytes": 500000000
+    },
+    {
+      "id": "discord-boost-2",
+      "group": "Discord",
+      "label": "Boosted server, level 2",
+      "bytes": 50000000,
+      "note": "Applies to every member of that server, Nitro or not."
+    },
+    {
+      "id": "discord-boost-3",
+      "group": "Discord",
+      "label": "Boosted server, level 3",
+      "bytes": 100000000,
+      "note": "Discord uses whichever is larger: your account cap or the server's."
+    },
+    {
+      "id": "gmail",
+      "group": "Email",
+      "label": "Gmail attachment",
+      "bytes": 25000000
+    },
+    {
+      "id": "outlook",
+      "group": "Email",
+      "label": "Outlook attachment",
+      "bytes": 20000000
+    },
+    {
+      "id": "whatsapp",
+      "group": "Messaging",
+      "label": "WhatsApp media",
+      "bytes": 16000000
+    },
+    {
+      "id": "telegram",
+      "group": "Messaging",
+      "label": "Telegram",
+      "bytes": 2000000000
+    },
+    {
+      "id": "slack",
+      "group": "Work",
+      "label": "Slack",
+      "bytes": 1000000000
+    }
+  ]
+}
