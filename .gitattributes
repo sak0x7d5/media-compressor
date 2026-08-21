@@ -1,0 +1,21 @@
+# Normalise line endings in the repository to LF, whatever the checkout does
+# locally. Without this, a contributor on macOS or Linux sees every file this
+# project was authored on Windows as wholly modified.
+* text=auto eol=lf
+
+# Binary assets git must never try to normalise.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.avif binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.mp4 binary
+*.exe binary
+*.dll binary
+
+# Lock files are generated; keep them out of diff review.
+pnpm-lock.yaml linguist-generated=true -diff
+src-tauri/Cargo.lock linguist-generated=true -diff
