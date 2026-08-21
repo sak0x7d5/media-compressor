@@ -206,21 +206,54 @@ fn worker(
     }
 }
 
-/// Where a compressed file goes by default: beside the original, renamed, never
-/// on top of it.
+/// Two directories that are the same place, as best we can tell.
 ///
-/// The extension is chosen by the caller because it is not always the input's:
-/// a PNG compressed for Discord comes back as WebP.
-pub fn default_output_path(input: &Path, extension: &str) -> PathBuf {
+/// Canonicalising resolves trailing separators, `.`, and case differences that
+/// would otherwise make the source folder look like a different one — which
+/// matters because the answer decides whether the output can safely keep the
+/// original's name.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Where a compressed file goes.
+///
+/// `directory` of `None` means "beside the original", which is the default.
+///
+/// The name depends on where it lands. Sharing a folder with the source, the
+/// output must be distinguished or it would land on top of the original, so it
+/// gains a "(compressed)" suffix. Given a folder of its own there is nothing to
+/// collide with, so it keeps the source's exact name — which matters because
+/// Discord shows the filename to everyone in the channel.
+///
+/// An existing file is never replaced, and the source is never overwritten.
+pub fn output_path_for(input: &Path, extension: &str, directory: Option<&Path>) -> PathBuf {
     let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    let target = directory.unwrap_or(parent);
     let stem = input.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
 
-    let mut candidate = parent.join(format!("{stem} (compressed).{extension}"));
+    let beside_source = same_directory(target, parent);
+
+    let name = |counter: Option<u32>| -> String {
+        match (beside_source, counter) {
+            (true, None) => format!("{stem} (compressed).{extension}"),
+            (true, Some(n)) => format!("{stem} (compressed {n}).{extension}"),
+            (false, None) => format!("{stem}.{extension}"),
+            (false, Some(n)) => format!("{stem} ({n}).{extension}"),
+        }
+    };
+
+    let mut candidate = target.join(name(None));
     let mut counter = 2;
 
-    // Never silently replace an earlier result either.
-    while candidate.exists() {
-        candidate = parent.join(format!("{stem} (compressed {counter}).{extension}"));
+    // `candidate == input` guards the case where the source already carries the
+    // name we would generate: overwriting the file being read is the one
+    // outcome that loses data outright.
+    while candidate.exists() || same_file(&candidate, input) {
+        candidate = target.join(name(Some(counter)));
         counter += 1;
         if counter > 999 {
             break;
@@ -230,6 +263,13 @@ pub fn default_output_path(input: &Path, extension: &str) -> PathBuf {
     candidate
 }
 
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,12 +277,77 @@ mod tests {
     #[test]
     fn the_default_output_sits_beside_the_input_and_never_overwrites_it() {
         let input = PathBuf::from("D:/clips/raid.mp4");
-        let output = default_output_path(&input, "mp4");
+        let output = output_path_for(&input, "mp4", None);
 
         assert_eq!(output.parent(), input.parent());
         assert_ne!(output, input, "must never overwrite the source");
         assert_eq!(output.extension().unwrap(), "mp4");
         assert!(output.to_string_lossy().contains("raid"));
+    }
+
+    #[test]
+    fn a_chosen_folder_keeps_the_original_name() {
+        let dir = std::env::temp_dir()
+            .join("media-compressor-tests")
+            .join(format!("outdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source_dir = dir.join("source");
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let input = source_dir.join("Rocket League_replay.mp4");
+        std::fs::write(&input, b"source").unwrap();
+
+        let output = output_path_for(&input, "mp4", Some(&out_dir));
+
+        // A folder of its own has nothing to collide with, so no suffix — the
+        // name Discord shows to everyone stays clean.
+        assert_eq!(output.file_name().unwrap(), "Rocket League_replay.mp4");
+        assert!(same_directory(output.parent().unwrap(), &out_dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn choosing_the_sources_own_folder_still_avoids_overwriting_it() {
+        let dir = std::env::temp_dir()
+            .join("media-compressor-tests")
+            .join(format!("samedir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let input = dir.join("clip.mp4");
+        std::fs::write(&input, b"source").unwrap();
+
+        // Explicitly pointing the output at the source's own folder must behave
+        // like "beside the original", not like a clean folder — otherwise the
+        // encode would write straight over the file it is reading.
+        let output = output_path_for(&input, "mp4", Some(&dir));
+
+        assert_ne!(output, input, "must never overwrite the source");
+        assert!(
+            output.file_name().unwrap().to_string_lossy().contains("compressed"),
+            "expected a distinguishing suffix, got {output:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_image_changing_format_never_lands_on_its_source() {
+        let dir = std::env::temp_dir()
+            .join("media-compressor-tests")
+            .join(format!("imgout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(dir.join("shot.png"), b"source").unwrap();
+
+        let output = output_path_for(&dir.join("shot.png"), "webp", Some(&out_dir));
+        assert_eq!(output.file_name().unwrap(), "shot.webp");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -256,10 +361,10 @@ mod tests {
         let input = dir.join("clip.mp4");
         std::fs::write(&input, b"source").unwrap();
 
-        let first = default_output_path(&input, "mp4");
+        let first = output_path_for(&input, "mp4", None);
         std::fs::write(&first, b"already compressed once").unwrap();
 
-        let second = default_output_path(&input, "mp4");
+        let second = output_path_for(&input, "mp4", None);
         assert_ne!(second, first, "a second run must not clobber the first result");
         assert!(!second.exists());
 

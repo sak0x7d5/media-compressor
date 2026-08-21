@@ -8,7 +8,7 @@ use crate::ffmpeg::tools::FfmpegTools;
 use crate::images::{is_image, ImageFormat};
 use crate::presets::{self, PresetFile};
 use crate::preview::{self, PreviewPair};
-use crate::queue::{default_output_path, JobEvent, Queue, QueueItem};
+use crate::queue::{output_path_for, JobEvent, Queue, QueueItem};
 use crate::shell_integration;
 use crate::strategy::plan::Options;
 use crate::strategy::{MediaInfo, SharpnessBias, Target, VideoCodec};
@@ -100,6 +100,9 @@ pub struct EncodeSettings {
     pub image_format: Option<ImageFormat>,
     #[serde(default)]
     pub max_dimension: Option<u32>,
+    /// Where results are written. `None` means beside the original.
+    #[serde(default)]
+    pub output_dir: Option<String>,
 }
 
 fn default_margin() -> f64 {
@@ -226,6 +229,14 @@ pub fn add_files(
 ) -> Vec<QueuedFile> {
     let mut queued = Vec::with_capacity(paths.len());
 
+    // Resolved once: a folder that has gone missing since it was chosen falls
+    // back to writing beside the original rather than failing every job.
+    let output_dir = settings
+        .output_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_dir() || std::fs::create_dir_all(dir).is_ok());
+
     for path in paths {
         let input = PathBuf::from(&path);
         if !input.is_file() {
@@ -238,7 +249,7 @@ pub fn add_files(
         let image_format = settings.image_format.unwrap_or_default();
         let extension =
             if is_image(&input) { image_format.extension() } else { "mp4" };
-        let output = default_output_path(&input, extension);
+        let output = output_path_for(&input, extension, output_dir.as_deref());
         let input_bytes = std::fs::metadata(&input).map(|meta| meta.len()).unwrap_or(0);
         let name = input
             .file_name()
