@@ -112,7 +112,24 @@
 	}
 
 	.custom {
-		width: 74px;
+		width: 84px;
+		/* Right-aligned tabular digits so the number sits against the "MB" and
+		   does not shift as it grows. */
+		text-align: right;
+		font-variant-numeric: tabular-nums;
+		-moz-appearance: textfield;
+		appearance: textfield;
+	}
+
+	/* WebView2 draws its own spinner arrows here, and at this size they render
+	   as a cramped smudge that eats half the field. They are no loss: nobody
+	   nudges an upload cap one megabyte at a time — this is a field you type
+	   a number into. */
+	.custom::-webkit-outer-spin-button,
+	.custom::-webkit-inner-spin-button {
+		-webkit-appearance: none;
+		appearance: none;
+		margin: 0;
 	}
 
 	.unit {
