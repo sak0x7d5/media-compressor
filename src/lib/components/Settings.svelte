@@ -1,17 +1,48 @@
 <script lang="ts">
-	import type { EncodeSettings, FfmpegStatus, PresetFile } from '$lib/ipc';
+	import type { EncodeSettings, FfmpegStatus, OutputMode, PresetFile } from '$lib/ipc';
+	import { open } from '@tauri-apps/plugin-dialog';
 	import { setPresetsUrl, setShellMenu } from '$lib/ipc';
 
-	let { settings, status, shellMenu, presetsSourceUrl, onChange, onShellMenu, onPresets, onClose }: {
+	let {
+		settings,
+		status,
+		shellMenu,
+		presetsSourceUrl,
+		outputMode,
+		outputDir,
+		onChange,
+		onShellMenu,
+		onPresets,
+		onOutput,
+		onClose
+	}: {
 		settings: EncodeSettings;
 		status: FfmpegStatus | null;
 		shellMenu: boolean;
 		presetsSourceUrl: string;
+		outputMode: OutputMode;
+		outputDir: string | null;
 		onChange: (patch: Partial<EncodeSettings>) => void;
 		onShellMenu: (enabled: boolean) => void;
 		onPresets: (presets: PresetFile) => void;
+		onOutput: (mode: OutputMode, dir: string | null) => void;
 		onClose: () => void;
 	} = $props();
+
+	/**
+	 * Just the folder name, so a deep path does not blow out the row. Splits on
+	 * both separators — Windows hands back backslashes, and matching only
+	 * forward slashes would leave the whole path as the "name".
+	 */
+	const folderLabel = $derived(
+		outputDir ? (outputDir.split(/[/\\]/).filter(Boolean).pop() ?? outputDir) : 'Choose…'
+	);
+
+	async function pickFolder() {
+		const chosen = await open({ directory: true, title: 'Save compressed files to' });
+		if (!chosen) return;
+		onOutput('folder', Array.isArray(chosen) ? chosen[0] : chosen);
+	}
 
 	let shellBusy = $state(false);
 	let shellError = $state<string | null>(null);
@@ -55,6 +86,37 @@
 		<span class="title">Settings</span>
 		<button class="close" onclick={onClose} aria-label="Close settings">✕</button>
 	</div>
+
+	<label class="row">
+		<span class="name">Save results</span>
+		<select
+			value={outputMode}
+			onchange={(e) => {
+				const mode = e.currentTarget.value as OutputMode;
+				if (mode === 'folder' && !outputDir) void pickFolder();
+				else onOutput(mode, mode === 'beside' ? null : outputDir);
+			}}
+		>
+			<option value="beside">Next to the original</option>
+			<option value="folder">In a folder I choose</option>
+			<option value="ask">Ask me each time</option>
+		</select>
+	</label>
+
+	{#if outputMode === 'folder'}
+		<div class="row">
+			<span class="name sub">Folder</span>
+			<button class="toggle" onclick={pickFolder} title={outputDir ?? 'No folder chosen'}>
+				{folderLabel}
+			</button>
+		</div>
+	{/if}
+	{#if outputMode !== 'beside'}
+		<p class="hint">
+			Files saved to their own folder keep the original's name — no "(compressed)" for Discord
+			to show everyone. Next to the original they must be renamed to avoid overwriting it.
+		</p>
+	{/if}
 
 	<label class="row">
 		<span class="name">Video codec</span>
@@ -210,6 +272,11 @@
 		flex: 1;
 		font-size: 12px;
 		color: var(--text-secondary);
+	}
+
+	.name.sub {
+		padding-left: 12px;
+		color: var(--text-muted);
 	}
 
 	select,

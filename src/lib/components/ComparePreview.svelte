@@ -16,6 +16,11 @@
 		if (box.width === 0) return;
 		split = Math.max(0, Math.min(100, ((clientX - box.left) / box.width) * 100));
 	}
+
+	/* Each label hides once its side is nearly gone, so it never sits stranded
+	   over the wrong image. */
+	const showBefore = $derived(split > 12);
+	const showAfter = $derived(split < 88);
 </script>
 
 <svelte:window
@@ -25,9 +30,8 @@
 
 <div class="wrap">
 	<div class="head">
-		<span class="label">Original</span>
-		<span class="spacer"></span>
-		<span class="label">Compressed</span>
+		<span class="title">Compare</span>
+		<span class="hint">drag to wipe</span>
 		<button class="close" onclick={onClose} aria-label="Close comparison">✕</button>
 	</div>
 
@@ -44,6 +48,17 @@
 		<div class="layer clip" style:clip-path={`inset(0 ${100 - split}% 0 0)`}>
 			<img class="layer" src={pair.before} alt="Original frame" draggable="false" />
 		</div>
+
+		<!-- Labels sit on the image rather than in the header. Against a busy
+		     frame, muted text in a corner is invisible — these are opaque chips
+		     with a hard border so they read over anything, and they are
+		     pointer-transparent so they never swallow a drag. -->
+		{#if showBefore}
+			<span class="tag before">Original</span>
+		{/if}
+		{#if showAfter}
+			<span class="tag after">Compressed</span>
+		{/if}
 
 		<div class="handle" style:left={`${split}%`}>
 			<div class="grip"></div>
@@ -64,6 +79,15 @@
 
 <style>
 	.wrap {
+		/* Fills the pane rather than growing past it. A comparison you have to
+		   scroll cannot be judged: you never see the whole frame while wiping,
+		   and a drag near the bottom edge fights the scrollbar for the same
+		   gesture. Letterboxing costs some black bar; scrolling costs the
+		   comparison itself. */
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		min-height: 0;
 		margin: 6px;
 		background: var(--bg-row);
 		border-radius: var(--radius);
@@ -73,21 +97,24 @@
 	.head {
 		display: flex;
 		align-items: center;
-		gap: 8px;
+		gap: 10px;
 		margin-bottom: 10px;
+		flex: none;
 	}
 
-	.label {
+	.title {
+		font-size: 13px;
+		color: var(--text);
+	}
+
+	.hint {
 		font-family: var(--font-mono);
 		font-size: 11px;
 		color: var(--text-muted);
 	}
 
-	.spacer {
-		flex: 1;
-	}
-
 	.close {
+		margin-left: auto;
 		background: none;
 		border: none;
 		color: var(--text-muted);
@@ -103,6 +130,8 @@
 	.frame {
 		position: relative;
 		width: 100%;
+		flex: 1;
+		min-height: 0;
 		border-radius: 6px;
 		overflow: hidden;
 		cursor: ew-resize;
@@ -114,7 +143,10 @@
 	.layer {
 		display: block;
 		width: 100%;
-		height: auto;
+		height: 100%;
+		/* Both frames are extracted at the same width and aspect, so `contain`
+		   lays them out identically — which the wipe depends on. */
+		object-fit: contain;
 		user-select: none;
 		-webkit-user-drag: none;
 	}
@@ -122,6 +154,30 @@
 	.clip {
 		position: absolute;
 		inset: 0;
+	}
+
+	.tag {
+		position: absolute;
+		top: 10px;
+		z-index: 2;
+		pointer-events: none;
+		background: rgba(10, 10, 12, 0.82);
+		border: 1px solid rgba(255, 255, 255, 0.16);
+		color: #ffffff;
+		font-size: 11px;
+		font-weight: 500;
+		letter-spacing: 0.02em;
+		line-height: 1;
+		padding: 5px 9px;
+		border-radius: 5px;
+	}
+
+	.tag.before {
+		left: 10px;
+	}
+
+	.tag.after {
+		right: 10px;
 	}
 
 	.handle {
@@ -132,6 +188,7 @@
 		background: rgba(255, 255, 255, 0.85);
 		transform: translateX(-1px);
 		pointer-events: none;
+		z-index: 3;
 	}
 
 	.grip {
@@ -148,6 +205,7 @@
 
 	.slider {
 		width: 100%;
+		flex: none;
 		margin-top: 10px;
 		accent-color: var(--accent);
 	}

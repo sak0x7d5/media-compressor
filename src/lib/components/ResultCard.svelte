@@ -2,7 +2,7 @@
 	import type { Job } from '$lib/jobs.svelte';
 	import { formatBytes, formatReduction } from '$lib/format';
 
-	let { job, limitBytes, busy, onCopy, onReveal, onCompare, onClear }: {
+	let { job, limitBytes, busy, onCopy, onReveal, onCompare, onClear, onBack = null }: {
 		job: Job;
 		limitBytes: number;
 		busy: boolean;
@@ -10,6 +10,10 @@
 		onReveal: (path: string) => void;
 		onCompare: () => void;
 		onClear: () => void;
+		/* Present only when this card was opened from a queue of several files,
+		   in which case dismissing it should return to the list rather than
+		   discard the job. */
+		onBack?: (() => void) | null;
 	} = $props();
 
 	const outBytes = $derived(job.outcome?.output_bytes ?? 0);
@@ -35,7 +39,11 @@
 
 <div class="card">
 	<div class="head">
-		<span class="tick" style:color={barColor} aria-hidden="true">{overLimit ? '!' : '✓'}</span>
+		{#if onBack}
+			<button class="back" onclick={onBack} title="Back to the queue" aria-label="Back to the queue">‹</button>
+		{:else}
+			<span class="tick" style:color={barColor} aria-hidden="true">{overLimit ? '!' : '✓'}</span>
+		{/if}
 		<span class="name" title={job.output}>{job.name}</span>
 		<span class="spec">{job.detail}</span>
 	</div>
@@ -68,7 +76,7 @@
 		<button class="primary" onclick={() => onCopy(job.output)}>Copy to clipboard</button>
 		<button onclick={() => onReveal(job.output)}>Show in folder</button>
 		<button onclick={onCompare} disabled={busy}>{busy ? 'Loading…' : 'Compare'}</button>
-		<button class="trailing" onclick={onClear}>Done</button>
+		<button class="trailing" onclick={onBack ?? onClear}>{onBack ? 'Back to queue' : 'Done'}</button>
 	</div>
 </div>
 
@@ -91,6 +99,22 @@
 	.tick {
 		font-size: 14px;
 		flex: none;
+	}
+
+	.back {
+		flex: none;
+		background: none;
+		border: none;
+		color: var(--text-muted);
+		font-size: 18px;
+		line-height: 1;
+		padding: 0 4px;
+		border-radius: 4px;
+	}
+
+	.back:hover {
+		color: var(--text);
+		background: var(--bg-row-hover);
 	}
 
 	.name {

@@ -130,7 +130,12 @@ export interface EncodeSettings {
 	crf?: number;
 	image_format?: 'webp' | 'avif' | 'jpeg' | 'png';
 	max_dimension?: number;
+	/** Where results are written. Null or absent means beside the original. */
+	output_dir?: string | null;
 }
+
+/** Where compressed files land. */
+export type OutputMode = 'beside' | 'folder' | 'ask';
 
 export interface QueuedFile {
 	id: string;

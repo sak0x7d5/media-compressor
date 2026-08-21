@@ -2,14 +2,18 @@
 	import type { Job } from '$lib/jobs.svelte';
 	import { formatPercent } from '$lib/format';
 
-	let { job, onCancel, onRemove }: {
+	let { job, onCancel, onRemove, onSelect, onCopy }: {
 		job: Job;
 		onCancel: (id: string) => void;
 		onRemove: (id: string) => void;
+		onSelect: (id: string) => void;
+		onCopy: (path: string) => void;
 	} = $props();
 
 	const running = $derived(job.state === 'running');
 	const settled = $derived(job.state === 'done' || job.state === 'failed' || job.state === 'cancelled');
+	/* Only a finished job has a result worth opening. */
+	const selectable = $derived(job.state === 'done');
 
 	const statusColor = $derived(
 		job.state === 'done'
@@ -24,23 +28,80 @@
 	);
 </script>
 
-<div class="row" class:running>
+<!-- The row is a real button when the job has finished, but the role is set
+     conditionally so an unfinished row does not announce itself as clickable —
+     which the static check cannot see through. It cannot be a <button> element
+     either, because it contains one (the dismiss control). -->
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+<div
+	class="row"
+	class:running
+	class:selectable
+	role={selectable ? 'button' : undefined}
+	tabindex={selectable ? 0 : undefined}
+	title={selectable ? 'Open result' : job.input}
+	onclick={() => selectable && onSelect(job.id)}
+	onkeydown={(event) => {
+		if (selectable && (event.key === 'Enter' || event.key === ' ')) {
+			event.preventDefault();
+			onSelect(job.id);
+		}
+	}}
+>
 	<div class="labels">
-		<div class="name" title={job.input}>{job.name}</div>
+		<div class="name">{job.name}</div>
 		<div class="detail">{job.detail}</div>
 	</div>
 
-	<div class="status" style:color={statusColor}>{job.status}</div>
+	<!-- Once the size line reads "312 MB -> 19.2 MB", the word "done" adds
+	     nothing, so a finished row gets a tick and the space goes to the
+	     actions. Every other state still needs its word. -->
+	<div class="status" style:color={statusColor}>
+		{job.state === 'done' ? '✓' : job.status}
+	</div>
 
 	<div class="trailing">
 		{#if running}
 			<span class="percent">{formatPercent(job.fraction)}</span>
-			<button class="ghost" onclick={() => onCancel(job.id)} title="Cancel">✕</button>
-		{:else if settled}
-			<button class="ghost" onclick={() => onRemove(job.id)} title="Remove from list">✕</button>
-		{:else}
-			<button class="ghost" onclick={() => onCancel(job.id)} title="Remove from queue">✕</button>
 		{/if}
+
+		<!-- Every control here stops propagation: the row itself is clickable,
+		     and a button that also opened the detail view would be maddening. -->
+		{#if selectable}
+			<button
+				class="action primary"
+				onclick={(event) => {
+					event.stopPropagation();
+					onCopy(job.output);
+				}}
+				title="Copy the result, ready to paste"
+			>
+				Copy
+			</button>
+			<button
+				class="action"
+				onclick={(event) => {
+					event.stopPropagation();
+					onSelect(job.id);
+				}}
+				title="Open result"
+				aria-label="Open result"
+			>
+				⋯
+			</button>
+		{/if}
+
+		<button
+			class="ghost"
+			onclick={(event) => {
+				event.stopPropagation();
+				if (settled) onRemove(job.id);
+				else onCancel(job.id);
+			}}
+			title={running ? 'Cancel' : settled ? 'Remove from list' : 'Remove from queue'}
+		>
+			✕
+		</button>
 	</div>
 </div>
 
@@ -65,6 +126,42 @@
 
 	.row:not(.running):hover {
 		background: var(--bg-row-hover);
+	}
+
+	.row.selectable {
+		cursor: pointer;
+	}
+
+	.row.selectable:focus-visible {
+		outline: 1px solid var(--accent);
+		outline-offset: -1px;
+	}
+
+	.action {
+		border: 1px solid var(--border-strong);
+		background: none;
+		color: var(--text-secondary);
+		border-radius: 5px;
+		padding: 3px 9px;
+		font-size: 11px;
+		line-height: 1.5;
+	}
+
+	.action:hover {
+		background: var(--bg-row-hover);
+		color: var(--text);
+	}
+
+	/* Copy fills only when the pointer is on Copy itself — never on hover of the
+	   row. Lighting it up while the pointer sits on the dismiss control says
+	   "clicking does this" about an action that is not the one under the
+	   cursor. */
+	.action.primary:hover,
+	.action.primary:focus-visible {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--accent-ink);
+		font-weight: 500;
 	}
 
 	.labels {
@@ -100,6 +197,7 @@
 		gap: 6px;
 		min-width: 62px;
 		justify-content: flex-end;
+		flex: none;
 	}
 
 	.percent {
