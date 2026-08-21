@@ -1,0 +1,74 @@
+/* Global tokens and resets.
+   The window itself is translucent Mica, drawn by Windows, so the page
+   background must stay transparent — painting it opaque would throw away the
+   effect the whole design is built on. */
+
+:root {
+	--bg-panel: rgba(32, 32, 38, 0.92);
+	--bg-row: rgba(255, 255, 255, 0.045);
+	--bg-row-hover: rgba(255, 255, 255, 0.07);
+	--bg-track: rgba(255, 255, 255, 0.07);
+
+	--border: rgba(255, 255, 255, 0.09);
+	--border-strong: rgba(255, 255, 255, 0.14);
+
+	--text: #ededf2;
+	--text-secondary: #b9b9c4;
+	--text-muted: #8b8b96;
+
+	--accent: #7f77dd;
+	--accent-ink: #15151a;
+	--success: #5dcaa5;
+	--warning: #efa127;
+	--danger: #e2635a;
+
+	--radius: 7px;
+	--radius-lg: 10px;
+
+	--font: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+	/* Tabular numerals are what make a queue scan as a column rather than a
+	   ragged list. */
+	--font-mono: 'Cascadia Mono', 'Consolas', ui-monospace, monospace;
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	height: 100%;
+	background: transparent;
+	color: var(--text);
+	font-family: var(--font);
+	font-size: 13px;
+	overflow: hidden;
+	/* Selecting UI chrome by accident while dragging files is pure noise. */
+	user-select: none;
+	-webkit-user-select: none;
+}
+
+button {
+	font: inherit;
+	color: inherit;
+	cursor: pointer;
+}
+
+::-webkit-scrollbar {
+	width: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+	background: rgba(255, 255, 255, 0.12);
+	border-radius: 5px;
+	border: 3px solid transparent;
+	background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+	background: rgba(255, 255, 255, 0.2);
+	background-clip: content-box;
+}

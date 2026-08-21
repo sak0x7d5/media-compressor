@@ -1,0 +1,433 @@
+<script lang="ts">
+	import { onMount } from 'svelte';
+	import { getCurrentWebview } from '@tauri-apps/api/webview';
+	import { open } from '@tauri-apps/plugin-dialog';
+	import type { UnlistenFn } from '@tauri-apps/api/event';
+
+	import ComparePreview from '$lib/components/ComparePreview.svelte';
+	import DropZone from '$lib/components/DropZone.svelte';
+	import FileRow from '$lib/components/FileRow.svelte';
+	import FirstRun from '$lib/components/FirstRun.svelte';
+	import ResultCard from '$lib/components/ResultCard.svelte';
+	import Settings from '$lib/components/Settings.svelte';
+	import TargetPicker from '$lib/components/TargetPicker.svelte';
+
+	import { JobList } from '$lib/jobs.svelte';
+	import { formatBytes } from '$lib/format';
+	import {
+		addFiles,
+		cancelAll,
+		cancelJob,
+		copyToClipboard,
+		ffmpegStatus,
+		installFfmpeg,
+		listPresets,
+		onInstallProgress,
+		onJobEvent,
+		onOpenFiles,
+		pendingFiles,
+		previewPair,
+		revealInFolder,
+		shellMenuStatus,
+		type EncodeSettings,
+		type FfmpegStatus,
+		type InstallProgress,
+		type PresetFile,
+		type PreviewPair
+	} from '$lib/ipc';
+
+	const CUSTOM = '__custom__';
+	const MEDIA_EXTENSIONS = [
+		'mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v', 'wmv', 'flv', 'mpg', 'mpeg', 'ts', 'gif',
+		'png', 'jpg', 'jpeg', 'webp', 'avif', 'bmp', 'tiff'
+	];
+
+	const jobs = new JobList();
+
+	let status = $state<FfmpegStatus | null>(null);
+	let presets = $state<PresetFile | null>(null);
+	let selectedId = $state('');
+	let customBytes = $state(20_000_000);
+
+	let installing = $state(false);
+	let installProgress = $state<InstallProgress | null>(null);
+	let installError = $state<string | null>(null);
+
+	let hovering = $state(false);
+	let toast = $state<string | null>(null);
+	let toastTimer: ReturnType<typeof setTimeout> | undefined;
+
+	let showSettings = $state(false);
+	let shellMenu = $state(false);
+	let preview = $state<PreviewPair | null>(null);
+	let previewBusy = $state(false);
+
+	let options = $state<Omit<EncodeSettings, 'target_bytes'>>({
+		safety_margin: 0.95,
+		codec: 'h264',
+		bias: 'balanced',
+		speed: 'balanced',
+		image_format: 'webp'
+	});
+
+	const limitBytes = $derived(
+		selectedId === CUSTOM
+			? customBytes
+			: (presets?.presets.find((preset) => preset.id === selectedId)?.bytes ?? customBytes)
+	);
+
+	const settings = $derived<EncodeSettings>({ ...options, target_bytes: limitBytes });
+	const soleResult = $derived(jobs.soleResult);
+
+	function flash(message: string) {
+		toast = message;
+		clearTimeout(toastTimer);
+		toastTimer = setTimeout(() => (toast = null), 2600);
+	}
+
+	function looksLikeMedia(path: string): boolean {
+		const extension = path.split('.').pop()?.toLowerCase() ?? '';
+		return MEDIA_EXTENSIONS.includes(extension);
+	}
+
+	async function enqueue(paths: string[]) {
+		const media = paths.filter(looksLikeMedia);
+		if (media.length === 0) {
+			if (paths.length > 0) flash('That file type is not supported');
+			return;
+		}
+
+		preview = null;
+		try {
+			jobs.add(await addFiles(media, settings));
+		} catch (error) {
+			flash(String(error));
+		}
+	}
+
+	async function browse() {
+		const chosen = await open({
+			multiple: true,
+			filters: [{ name: 'Media', extensions: MEDIA_EXTENSIONS }]
+		});
+		if (!chosen) return;
+		await enqueue(Array.isArray(chosen) ? chosen : [chosen]);
+	}
+
+	async function install() {
+		installing = true;
+		installError = null;
+		try {
+			status = await installFfmpeg();
+		} catch (error) {
+			installError = String(error);
+		} finally {
+			installing = false;
+		}
+	}
+
+	async function copy(path: string) {
+		try {
+			await copyToClipboard([path]);
+			flash('Copied — paste it into Discord');
+		} catch (error) {
+			flash(String(error));
+		}
+	}
+
+	async function copyAllFinished() {
+		const paths = jobs.finished.map((job) => job.output);
+		if (paths.length === 0) return;
+		try {
+			await copyToClipboard(paths);
+			flash(paths.length === 1 ? 'Copied' : `Copied ${paths.length} files`);
+		} catch (error) {
+			flash(String(error));
+		}
+	}
+
+	async function compare(input: string, output: string) {
+		previewBusy = true;
+		try {
+			preview = await previewPair(input, output);
+		} catch (error) {
+			flash(String(error));
+		} finally {
+			previewBusy = false;
+		}
+	}
+
+	onMount(() => {
+		const unlisteners: Promise<UnlistenFn>[] = [];
+
+		(async () => {
+			status = await ffmpegStatus();
+			presets = await listPresets();
+			const fallback = presets.presets.find((preset) => preset.default) ?? presets.presets[0];
+			if (fallback) {
+				selectedId = fallback.id;
+				customBytes = fallback.bytes;
+			}
+
+			shellMenu = await shellMenuStatus();
+
+			// Files handed to us on the command line — the Explorer context menu
+			// path for a cold start.
+			const queued = await pendingFiles();
+			if (queued.length > 0) await enqueue(queued);
+		})();
+
+		unlisteners.push(onJobEvent((event) => jobs.apply(event)));
+		unlisteners.push(onInstallProgress((event) => (installProgress = event)));
+		// A second launch forwards its files here rather than opening a window.
+		unlisteners.push(onOpenFiles((paths) => void enqueue(paths)));
+
+		// Tauri delivers OS drag-and-drop to the webview rather than as DOM
+		// events, so the browser's own dragover/drop never fire here.
+		unlisteners.push(
+			getCurrentWebview().onDragDropEvent((event) => {
+				if (event.payload.type === 'over') hovering = true;
+				else if (event.payload.type === 'leave') hovering = false;
+				else if (event.payload.type === 'drop') {
+					hovering = false;
+					void enqueue(event.payload.paths);
+				}
+			})
+		);
+
+		return () => {
+			clearTimeout(toastTimer);
+			for (const pending of unlisteners) {
+				void pending.then((unlisten) => unlisten());
+			}
+		};
+	});
+</script>
+
+<main>
+	{#if status && !status.installed}
+		<FirstRun
+			progress={installProgress}
+			error={installError}
+			busy={installing}
+			onInstall={install}
+		/>
+	{:else}
+		<header>
+			<span class="count">
+				{jobs.jobs.length === 0
+					? 'No files'
+					: `${jobs.jobs.length} ${jobs.jobs.length === 1 ? 'file' : 'files'}`}
+			</span>
+			<div class="target">
+				<TargetPicker
+					{presets}
+					{selectedId}
+					{customBytes}
+					onSelect={(id) => (selectedId = id)}
+					onCustom={(bytes) => (customBytes = bytes)}
+				/>
+			</div>
+			<button
+				class="icon"
+				class:active={showSettings}
+				onclick={() => (showSettings = !showSettings)}
+				aria-label="Settings"
+				title="Settings"
+			>
+				⚙
+			</button>
+		</header>
+
+		<section class="body" class:empty={jobs.jobs.length === 0 && !showSettings}>
+			{#if showSettings}
+				<Settings
+					settings={{ ...options, target_bytes: limitBytes }}
+					{status}
+					{shellMenu}
+					presetsSourceUrl={presets?.source_url ?? ''}
+					onChange={(patch) => (options = { ...options, ...patch })}
+					onShellMenu={(enabled) => (shellMenu = enabled)}
+					onPresets={(next) => (presets = next)}
+					onClose={() => (showSettings = false)}
+				/>
+			{:else if preview}
+				<ComparePreview pair={preview} onClose={() => (preview = null)} />
+			{:else if jobs.jobs.length === 0}
+				<DropZone {hovering} onBrowse={browse} />
+			{:else if soleResult}
+				<ResultCard
+					job={soleResult}
+					{limitBytes}
+					busy={previewBusy}
+					onCopy={copy}
+					onReveal={(path) => void revealInFolder(path)}
+					onCompare={() => compare(soleResult.input, soleResult.output)}
+					onClear={() => jobs.remove(soleResult.id)}
+				/>
+			{:else}
+				<div class="list">
+					{#each jobs.jobs as job (job.id)}
+						<FileRow
+							{job}
+							onCancel={(id) => void cancelJob(id)}
+							onRemove={(id) => jobs.remove(id)}
+						/>
+					{/each}
+				</div>
+			{/if}
+		</section>
+
+		<footer>
+			<span class="summary">
+				{#if jobs.anyRunning}
+					encoding · target {formatBytes(limitBytes)}
+				{:else if jobs.finished.length > 0}
+					{jobs.finished.length} done · target {formatBytes(limitBytes)}
+				{:else}
+					target {formatBytes(limitBytes)} · {options.codec}
+				{/if}
+			</span>
+
+			{#if jobs.finished.length > 1}
+				<button onclick={copyAllFinished}>Copy all</button>
+			{/if}
+
+			{#if jobs.anyRunning}
+				<button onclick={() => void cancelAll()}>Stop</button>
+			{:else if jobs.jobs.length > 0}
+				<button onclick={() => jobs.clear()}>Clear</button>
+			{/if}
+
+			<button class="primary" onclick={browse}>Add files</button>
+		</footer>
+	{/if}
+
+	{#if toast}
+		<div class="toast">{toast}</div>
+	{/if}
+</main>
+
+<style>
+	main {
+		position: relative;
+		display: flex;
+		flex-direction: column;
+		margin: 8px;
+		height: calc(100vh - 16px);
+		background: var(--bg-panel);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-lg);
+		overflow: hidden;
+	}
+
+	header {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 10px 14px;
+		border-bottom: 1px solid var(--border);
+		flex: none;
+	}
+
+	.count {
+		font-size: 12px;
+		color: var(--text-secondary);
+	}
+
+	.target {
+		margin-left: auto;
+	}
+
+	.icon {
+		background: none;
+		border: none;
+		color: var(--text-muted);
+		font-size: 14px;
+		padding: 3px 6px;
+		border-radius: 5px;
+		line-height: 1;
+	}
+
+	.icon:hover,
+	.icon.active {
+		color: var(--text);
+		background: var(--bg-row-hover);
+	}
+
+	.body {
+		flex: 1;
+		min-height: 0;
+		overflow-y: auto;
+		padding: 6px;
+	}
+
+	.body.empty {
+		padding: 14px;
+	}
+
+	.list {
+		display: flex;
+		flex-direction: column;
+	}
+
+	footer {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 12px 14px;
+		border-top: 1px solid var(--border);
+		flex: none;
+	}
+
+	.summary {
+		flex: 1;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		color: var(--text-muted);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	button {
+		border: 1px solid var(--border-strong);
+		background: none;
+		color: var(--text-secondary);
+		border-radius: 6px;
+		padding: 5px 11px;
+		font-size: 12px;
+		flex: none;
+	}
+
+	button:hover {
+		background: var(--bg-row-hover);
+		color: var(--text);
+	}
+
+	button.primary {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--accent-ink);
+		font-weight: 500;
+	}
+
+	button.primary:hover {
+		filter: brightness(1.1);
+	}
+
+	.toast {
+		position: absolute;
+		left: 50%;
+		bottom: 62px;
+		transform: translateX(-50%);
+		background: #2c2c34;
+		border: 1px solid var(--border-strong);
+		border-radius: 6px;
+		padding: 7px 14px;
+		font-size: 12px;
+		color: var(--text);
+		box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+		white-space: nowrap;
+	}
+</style>

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Media Compressor",
+  "version": "0.1.0",
+  "identifier": "com.sarim.mediacompressor",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Media Compressor",
+        "width": 660,
+        "height": 560,
+        "minWidth": 520,
+        "minHeight": 400,
+        "resizable": true,
+        "theme": "Dark",
+        "transparent": true,
+        "windowEffects": {
+          "effects": ["micaDark"],
+          "state": "active"
+        },
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "resources": ["resources/presets.json"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

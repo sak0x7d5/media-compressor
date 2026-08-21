@@ -1,0 +1,110 @@
+//! Pulling a matched pair of frames out of the source and the result.
+//!
+//! The point is to answer "what did this actually cost me" before you send the
+//! file. Both frames are taken at the same timestamp and scaled to the same
+//! width, so the only difference on screen is the compression.
+
+use crate::ffmpeg::tools::FfmpegTools;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use serde::Serialize;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use thiserror::Error;
+
+/// Wide enough to show artefacts, small enough to move over IPC as base64
+/// without the payload becoming the slow part.
+const PREVIEW_WIDTH: u32 = 720;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewPair {
+    /// `data:` URLs, ready to drop into an `<img src>`.
+    pub before: String,
+    pub after: String,
+    pub at_seconds: f64,
+}
+
+#[derive(Debug, Error)]
+pub enum PreviewError {
+    #[error("could not run ffmpeg: {0}")]
+    Spawn(#[from] std::io::Error),
+
+    #[error("could not read a frame from {which}")]
+    NoFrame { which: &'static str },
+}
+
+/// Grab one frame as JPEG bytes, straight off stdout.
+fn grab_frame(tools: &FfmpegTools, path: &Path, at_seconds: f64) -> Result<Vec<u8>, PreviewError> {
+    let mut command = Command::new(&tools.ffmpeg);
+    command
+        .args(["-hide_banner", "-v", "error", "-nostdin"])
+        // Seeking before -i jumps to the nearest keyframe instead of decoding
+        // everything up to that point.
+        .args(["-ss", &format!("{at_seconds:.3}")])
+        .arg("-i")
+        .arg(path)
+        .args(["-frames:v", "1", "-map", "0:v:0", "-an"])
+        .args(["-vf", &format!("scale={PREVIEW_WIDTH}:-2:flags=lanczos")])
+        .args(["-q:v", "3", "-f", "mjpeg", "pipe:1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    crate::ffmpeg::hide_console(&mut command);
+
+    let output = command.output()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Err(PreviewError::NoFrame { which: "the file" });
+    }
+    Ok(output.stdout)
+}
+
+fn as_data_url(bytes: &[u8]) -> String {
+    format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes))
+}
+
+/// Take the same frame from both files.
+///
+/// `at_seconds` defaults to the midpoint: the first and last moments of a clip
+/// are too often a fade or a title card to be worth comparing.
+pub fn compare(
+    tools: &FfmpegTools,
+    before: &Path,
+    after: &Path,
+    at_seconds: Option<f64>,
+) -> Result<PreviewPair, PreviewError> {
+    let at_seconds = at_seconds.unwrap_or_else(|| {
+        crate::ffmpeg::probe::probe(tools, before)
+            .map(|info| info.duration_secs / 2.0)
+            .unwrap_or(0.0)
+    });
+    // A still image has no timeline to seek along.
+    let at_seconds = if at_seconds.is_finite() && at_seconds > 0.0 { at_seconds } else { 0.0 };
+
+    let before_frame = grab_frame(tools, before, at_seconds)
+        .map_err(|_| PreviewError::NoFrame { which: "the original" })?;
+    let after_frame = grab_frame(tools, after, at_seconds)
+        .map_err(|_| PreviewError::NoFrame { which: "the result" })?;
+
+    Ok(PreviewPair {
+        before: as_data_url(&before_frame),
+        after: as_data_url(&after_frame),
+        at_seconds,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frames_are_wrapped_as_data_urls() {
+        let url = as_data_url(&[0xff, 0xd8, 0xff]);
+        assert!(url.starts_with("data:image/jpeg;base64,"));
+        assert!(url.len() > "data:image/jpeg;base64,".len());
+    }
+
+    #[test]
+    fn an_empty_frame_still_produces_a_well_formed_url() {
+        // Not a useful image, but it must not panic or produce a broken prefix.
+        assert_eq!(as_data_url(&[]), "data:image/jpeg;base64,");
+    }
+}
