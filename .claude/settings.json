@@ -4,18 +4,14 @@
       "Bash(export PATH=*)",
       "Bash(cd *)",
       "Bash(pwd)",
-
       "Bash(cargo *)",
       "Bash(rustc *)",
       "Bash(rustup *)",
-
       "Bash(pnpm *)",
       "Bash(node *)",
       "Bash(npx *)",
-
       "Bash(ffmpeg *)",
       "Bash(ffprobe *)",
-
       "Bash(ls *)",
       "Bash(cat *)",
       "Bash(head *)",
@@ -31,7 +27,6 @@
       "Bash(du *)",
       "Bash(stat *)",
       "Bash(seq *)",
-
       "Bash(git status*)",
       "Bash(git log*)",
       "Bash(git diff*)",
@@ -44,7 +39,6 @@
     ],
     "deny": [
       "Bash(rm -rf *)",
-      "Bash(git push*)",
       "Bash(git reset --hard*)",
       "Bash(git clean*)",
       "Bash(sed -i *)"
