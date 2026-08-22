@@ -101,6 +101,44 @@ use a specific build instead. Debug builds additionally fall back to PATH, so
 
 ---
 
+## Releases and updating
+
+The app can update itself: it asks the release host what the newest version is
+and installs it, so nobody has to go and fetch an installer again. Every update
+must carry a signature made with this project's private key, and the matching
+public key is compiled into the binary — a compromised download host cannot push
+anything the app will accept.
+
+Publishing a release is one command:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+That triggers a workflow which builds the installer, signs it, and publishes a
+draft release including a `latest.json` describing the new version. Installed
+copies check that file and offer the update.
+
+**Two things must be true before the first release:**
+
+1. **The repository must be public.** Downloads from a private repository
+   require a login, so no installed copy could fetch an update. This is the only
+   thing currently keeping the feature dormant.
+2. **The `TAURI_SIGNING_PRIVATE_KEY` secret must be set** to the contents of the
+   private key file, under Settings → Secrets and variables → Actions. The key
+   lives outside this repository by design and must never be committed; losing
+   it means existing installs can never be updated again, because they will
+   reject anything signed with a different key.
+
+Until both are done, the in-app check simply reports that it could not reach the
+update server, which is accurate and harmless.
+
+**Update support only works forward.** A copy of the app can only update itself
+if the build the user installed already contained the updater. Anyone running a
+build from before this was added has to install once manually.
+
+---
+
 ## Development
 
 Requires Rust (stable), Node 20+, pnpm, and the MSVC C++ build tools on Windows.

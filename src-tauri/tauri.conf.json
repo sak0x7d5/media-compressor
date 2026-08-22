@@ -22,7 +22,9 @@
         "theme": "Dark",
         "transparent": true,
         "windowEffects": {
-          "effects": ["micaDark"],
+          "effects": [
+            "micaDark"
+          ],
           "state": "active"
         },
         "dragDropEnabled": true
@@ -34,14 +36,30 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "resources": ["resources/presets.json"],
+    "targets": [
+      "nsis"
+    ],
+    "resources": [
+      "resources/presets.json"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/sak0x7d5/media-compressor/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJGOUNBNEQzMEYzRjlFMTgKUldRWW5qOFAwNlNjdnlueHkySk56WGJ6OGpKTWNzeWgxV3hKcEVWU04zRXJNLzczWlIzZldtSFEK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

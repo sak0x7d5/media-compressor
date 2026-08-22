@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { EncodeSettings, FfmpegStatus, OutputMode, PresetFile } from '$lib/ipc';
 	import { open } from '@tauri-apps/plugin-dialog';
-	import { setPresetsUrl, setShellMenu } from '$lib/ipc';
+	import { checkForUpdate, installUpdate, setPresetsUrl, setShellMenu } from '$lib/ipc';
 
 	let {
 		settings,
@@ -46,6 +46,39 @@
 
 	let shellBusy = $state(false);
 	let shellError = $state<string | null>(null);
+
+	type UpdateState =
+		| { kind: 'idle' }
+		| { kind: 'checking' }
+		| { kind: 'current' }
+		| { kind: 'available'; version: string }
+		| { kind: 'installing' }
+		| { kind: 'failed'; message: string };
+
+	let update = $state<UpdateState>({ kind: 'idle' });
+
+	async function checkUpdates() {
+		update = { kind: 'checking' };
+		try {
+			const found = await checkForUpdate();
+			// Null means up to date. That is genuinely different from a failed
+			// check, so the two never share a message.
+			update = found ? { kind: 'available', version: found.version } : { kind: 'current' };
+		} catch (error) {
+			update = { kind: 'failed', message: String(error) };
+		}
+	}
+
+	async function applyUpdate() {
+		update = { kind: 'installing' };
+		try {
+			// On success the app restarts into the new version, so nothing after
+			// this runs.
+			await installUpdate();
+		} catch (error) {
+			update = { kind: 'failed', message: String(error) };
+		}
+	}
 
 	/* Kept in sync with the prop rather than seeded from it once: saving writes
 	   a new preset file back through the parent, and a field that captured only
@@ -221,6 +254,33 @@
 	</p>
 	{#if urlError}
 		<p class="warn">{urlError}</p>
+	{/if}
+
+	<div class="row">
+		<span class="name">Updates</span>
+		{#if update.kind === 'available'}
+			<button class="toggle on" onclick={applyUpdate}>Install {update.version}</button>
+		{:else}
+			<button
+				class="toggle"
+				disabled={update.kind === 'checking' || update.kind === 'installing'}
+				onclick={checkUpdates}
+			>
+				{update.kind === 'checking'
+					? 'Checking…'
+					: update.kind === 'installing'
+						? 'Installing…'
+						: 'Check now'}
+			</button>
+		{/if}
+	</div>
+	{#if update.kind === 'current'}
+		<p class="hint">You're on the newest version.</p>
+	{:else if update.kind === 'failed'}
+		<p class="hint">
+			Couldn't reach the update server. That's expected while the project repository is
+			private — no releases are published yet.
+		</p>
 	{/if}
 
 	<div class="foot">
