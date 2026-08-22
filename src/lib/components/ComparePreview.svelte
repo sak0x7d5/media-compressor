@@ -17,6 +17,33 @@
 		split = Math.max(0, Math.min(100, ((clientX - box.left) / box.width) * 100));
 	}
 
+	function nudge(by: number) {
+		split = Math.max(0, Math.min(100, split + by));
+	}
+
+	/* The frame is the slider, so it takes the keys directly. A separate range
+	   input below would be a second visible control for one value. */
+	function onKeydown(event: KeyboardEvent) {
+		const step = event.shiftKey ? 10 : 2;
+		switch (event.key) {
+			case 'ArrowLeft':
+				nudge(-step);
+				break;
+			case 'ArrowRight':
+				nudge(step);
+				break;
+			case 'Home':
+				split = 0;
+				break;
+			case 'End':
+				split = 100;
+				break;
+			default:
+				return;
+		}
+		event.preventDefault();
+	}
+
 	/* Each label hides once its side is nearly gone, so it never sits stranded
 	   over the wrong image. */
 	const showBefore = $derived(split > 12);
@@ -42,7 +69,15 @@
 			dragging = true;
 			setFromPointer(event.clientX);
 		}}
-		role="presentation"
+		onkeydown={onKeydown}
+		role="slider"
+		tabindex="0"
+		aria-label="Comparison position"
+		aria-orientation="horizontal"
+		aria-valuemin={0}
+		aria-valuemax={100}
+		aria-valuenow={Math.round(split)}
+		aria-valuetext={`${Math.round(split)}% original`}
 	>
 		<img class="layer" src={pair.after} alt="Compressed frame" draggable="false" />
 		<div class="layer clip" style:clip-path={`inset(0 ${100 - split}% 0 0)`}>
@@ -64,17 +99,6 @@
 			<div class="grip"></div>
 		</div>
 	</div>
-
-	<!-- Keyboard equivalent for the drag handle. -->
-	<input
-		class="slider"
-		type="range"
-		min="0"
-		max="100"
-		step="1"
-		bind:value={split}
-		aria-label="Comparison position"
-	/>
 </div>
 
 <style>
@@ -140,6 +164,13 @@
 		touch-action: none;
 	}
 
+	/* Only on keyboard focus: a ring around the image every time it is clicked
+	   would be noise. */
+	.frame:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 2px;
+	}
+
 	.layer {
 		display: block;
 		width: 100%;
@@ -201,12 +232,5 @@
 		border-radius: 50%;
 		background: rgba(255, 255, 255, 0.9);
 		box-shadow: 0 1px 6px rgba(0, 0, 0, 0.5);
-	}
-
-	.slider {
-		width: 100%;
-		flex: none;
-		margin-top: 10px;
-		accent-color: var(--accent);
 	}
 </style>
