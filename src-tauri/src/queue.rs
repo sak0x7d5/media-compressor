@@ -52,6 +52,10 @@ struct Shared {
     tokens: Mutex<HashMap<String, CancelToken>>,
     wake: Condvar,
     stopping: Mutex<bool>,
+    /// Shared with the worker. Cancelling a job that has not started removes it
+    /// before the worker ever sees it, so this side has to report those itself
+    /// or nothing ever will.
+    listener: Listener,
 }
 
 impl Shared {
@@ -85,6 +89,7 @@ impl Queue {
             tokens: Mutex::new(HashMap::new()),
             wake: Condvar::new(),
             stopping: Mutex::new(false),
+            listener: Arc::clone(&listener),
         });
 
         let worker_shared = Arc::clone(&shared);
@@ -108,21 +113,54 @@ impl Queue {
 
     /// Cancel a job whether it is running or still waiting.
     pub fn cancel(&self, id: &str) {
-        // Flip the token first: if the job is running, this is what stops it.
+        // Flip the token first: if the job is running, this is what stops it,
+        // and the worker reports it when the encode aborts.
         if let Some(token) = self.shared.tokens.lock().unwrap().get(id) {
             token.cancel();
         }
+
         // Then drop it from the queue, so a job that had not started yet never
         // does. Removing before cancelling would race a job that starts in
         // between the two.
-        self.shared.pending.lock().unwrap().retain(|item| item.id != id);
+        let was_waiting = {
+            let mut pending = self.shared.pending.lock().unwrap();
+            let before = pending.len();
+            pending.retain(|item| item.id != id);
+            pending.len() != before
+        };
+
+        // A job pulled from the queue never reaches the worker, so this is the
+        // only place that can report it. Without this the row sits on "queued"
+        // forever and no amount of clicking dismisses it.
+        if was_waiting {
+            self.shared.tokens.lock().unwrap().remove(id);
+            self.announce(JobEvent::Cancelled { id: id.to_string() });
+        }
     }
 
     pub fn cancel_all(&self) {
         for token in self.shared.tokens.lock().unwrap().values() {
             token.cancel();
         }
-        self.shared.pending.lock().unwrap().clear();
+
+        let abandoned: Vec<String> = {
+            let mut pending = self.shared.pending.lock().unwrap();
+            pending.drain(..).map(|item| item.id).collect()
+        };
+
+        for id in abandoned {
+            self.shared.tokens.lock().unwrap().remove(&id);
+            self.announce(JobEvent::Cancelled { id });
+        }
+    }
+
+    /// Emit an event, holding no locks.
+    ///
+    /// The listener reaches into the UI layer; calling it while holding the
+    /// queue's own locks invites a deadlock the first time that layer calls
+    /// back in.
+    fn announce(&self, event: JobEvent) {
+        (self.shared.listener)(event);
     }
 
     pub fn pending_count(&self) -> usize {
@@ -403,6 +441,63 @@ mod tests {
             matches!(event, JobEvent::Failed { .. }),
             "expected a failure, got {event:?}"
         );
+    }
+
+    fn waiting_item(id: &str) -> QueueItem {
+        QueueItem {
+            id: id.to_string(),
+            input: PathBuf::from("in.mp4"),
+            output: PathBuf::from("out.mp4"),
+            target: Target::new(20_000_000),
+            options: Options::default(),
+            speed: Speed::Fast,
+            work_dir: std::env::temp_dir().join("mc-queue-test"),
+            image_format: ImageFormat::Webp,
+            max_dimension: None,
+        }
+    }
+
+    /// The invariant a stalled row exposed: every job must end in *some*
+    /// reported state. Cancelling used to pull waiting jobs out of the queue
+    /// before the worker could see them, so nothing ever reported those — the
+    /// row sat on "queued" forever and could not be dismissed.
+    #[test]
+    fn every_job_is_reported_even_when_cancelled_before_it_runs() {
+        use std::collections::HashSet;
+        use std::time::{Duration, Instant};
+
+        let tools: Arc<Mutex<Option<FfmpegTools>>> = Arc::new(Mutex::new(None));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let queue = Queue::start(
+            tools,
+            Arc::new(move |event| {
+                let _ = tx.send(event);
+            }),
+        );
+
+        let ids: Vec<String> = (0..6).map(|n| format!("bulk-{n}")).collect();
+        for id in &ids {
+            queue.push(waiting_item(id));
+        }
+        queue.cancel_all();
+
+        let mut settled: HashSet<String> = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        while settled.len() < ids.len() && Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                // Either terminal state is acceptable; being told nothing is not.
+                Ok(JobEvent::Cancelled { id }) | Ok(JobEvent::Failed { id, .. }) => {
+                    settled.insert(id);
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        let stranded: Vec<&String> = ids.iter().filter(|id| !settled.contains(*id)).collect();
+        assert!(stranded.is_empty(), "these jobs were never reported: {stranded:?}");
     }
 
     #[test]
