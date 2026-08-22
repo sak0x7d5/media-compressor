@@ -8,6 +8,7 @@ pub mod preview;
 pub mod queue;
 pub mod shell_integration;
 pub mod strategy;
+pub mod updates;
 
 use tauri::{Emitter, Manager};
 
@@ -47,12 +48,17 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // The updater needs this to relaunch into the version it just installed.
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // The queue's worker thread needs an AppHandle to emit events, so
             // state is built here rather than before the builder runs.
             let state = commands::AppState::new(app.handle());
             let config_dir = state.config_dir.clone();
             app.manage(state);
+
+            updates::check_in_background(app.handle());
 
             // Refresh the preset list in the background. This is a no-op unless
             // the user has configured a source URL, and a failure is never
@@ -80,6 +86,8 @@ pub fn run() {
             commands::set_shell_menu,
             commands::set_presets_url,
             commands::refresh_presets,
+            updates::check_for_update,
+            updates::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

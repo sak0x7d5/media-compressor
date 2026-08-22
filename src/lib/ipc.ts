@@ -145,6 +145,13 @@ export interface QueuedFile {
 	input_bytes: number;
 }
 
+export interface UpdateInfo {
+	version: string;
+	current_version: string;
+	notes: string | null;
+	date: string | null;
+}
+
 export interface PreviewPair {
 	before: string;
 	after: string;
@@ -167,6 +174,10 @@ export const setPresetsUrl = (url: string | null) =>
 	invoke<PresetFile>('set_presets_url', { url });
 export const refreshPresets = (force = false) =>
 	invoke<PresetFile | null>('refresh_presets', { force });
+
+/** Resolves to null when already up to date; rejects when it couldn't find out. */
+export const checkForUpdate = () => invoke<UpdateInfo | null>('check_for_update');
+export const installUpdate = () => invoke<void>('install_update');
 
 export const pendingFiles = () => invoke<string[]>('pending_files');
 export const previewPair = (before: string, after: string, atSeconds?: number) =>

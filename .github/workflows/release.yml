@@ -1,0 +1,72 @@
+# Builds, signs and publishes a release when a version tag is pushed.
+#
+#     git tag v0.2.0 && git push origin v0.2.0
+#
+# That is the whole release process. The workflow produces the installer and a
+# `latest.json` describing it, which is the file installed copies of the app
+# check to discover that a newer version exists.
+#
+# Before the first release, two things must be true:
+#
+#   1. The repository is public. Downloads from a private repository require a
+#      login, so nobody's app could fetch the update.
+#   2. The secret TAURI_SIGNING_PRIVATE_KEY is set, holding the contents of the
+#      private key file. Updates are refused by the app unless signed with it.
+#      Settings -> Secrets and variables -> Actions -> New repository secret.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Lets the workflow be run by hand from the Actions tab to check it works,
+  # without publishing anything.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Rust builds are slow from cold; this makes repeat releases minutes
+      # rather than tens of minutes.
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+
+      # A release that fails its own tests is worse than a late release.
+      - run: pnpm check
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # The key was generated without a password, so this is deliberately
+          # empty rather than missing — the tool expects the variable to exist.
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Media Compressor ${{ github.ref_name }}'
+          releaseBody: 'Installed copies will offer this update automatically.'
+          releaseDraft: true
+          prerelease: false
