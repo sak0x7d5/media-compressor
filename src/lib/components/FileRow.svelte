@@ -95,10 +95,13 @@
 			class="ghost"
 			onclick={(event) => {
 				event.stopPropagation();
-				if (settled) onRemove(job.id);
-				else onCancel(job.id);
+				// Dismissing means "get this out of my list". Something still
+				// active has to be stopped too, but the row goes either way —
+				// cancelling without removing left the ✕ looking broken.
+				if (!settled) onCancel(job.id);
+				onRemove(job.id);
 			}}
-			title={running ? 'Cancel' : settled ? 'Remove from list' : 'Remove from queue'}
+			title={running ? 'Stop and remove' : 'Remove from list'}
 		>
 			✕
 		</button>
