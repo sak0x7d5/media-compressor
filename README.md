@@ -188,6 +188,28 @@ A format change replaces across the extension: compressing `clip.mov` leaves
 `clip.mp4` and no `clip.mov`. Comparing before and after is unavailable for a
 replaced file, because there is no longer a "before" to read.
 
+## Explorer right-click
+
+Offered as a ticked checkbox on the first-run screen, and toggleable afterwards
+under Settings → Explorer right-click. It puts **Compress for Discord** on
+videos and images.
+
+Registration writes under `HKEY_CURRENT_USER\Software\Classes`, so it needs no
+administrator rights and touches no other account on the machine. It attaches
+per extension rather than to `*`, which keeps the entry off every text file and
+spreadsheet, and it hangs off `SystemFileAssociations` rather than a ProgID so
+it survives the user changing their default video player. Selecting a dozen
+clips invokes the app once with all twelve rather than opening twelve copies.
+
+**On Windows 11 the entry appears under "Show more options"**, not in the short
+menu that opens first. Nothing about the registry can change that: the short
+menu only lists `IExplorerCommand` handlers shipped in a signed MSIX package.
+It is the same reason 7-Zip's entry lives down there.
+
+`register` and `unregister` are exact inverses, and a part-written menu reports
+itself as disabled — so re-enabling it rewrites the whole list and repairs the
+gap.
+
 ---
 
 ## FFmpeg

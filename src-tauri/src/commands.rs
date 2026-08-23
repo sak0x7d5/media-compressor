@@ -128,6 +128,10 @@ pub struct Startup {
     /// menu on a cold start. Consumed here, so this is the only place that
     /// will ever report them.
     pub pending_files: Vec<String>,
+    /// Whether this build can offer the Explorer entry at all. A constant, so it
+    /// rides along for free; the first-run screen needs it for its checkbox
+    /// before anything else has been asked.
+    pub shell_supported: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -615,6 +619,7 @@ pub fn startup(state: State<'_, AppState>) -> Startup {
         ffmpeg: FfmpegStatus::of(state.tools.lock().unwrap().as_ref()),
         presets: presets::load(&state.config_dir),
         pending_files: std::mem::take(&mut *state.pending_files.lock().unwrap()),
+        shell_supported: shell_integration::is_supported(),
     }
 }
 

@@ -47,6 +47,8 @@ export interface Startup {
 	presets: PresetFile;
 	/** Paths this launch was handed on the command line. */
 	pending_files: string[];
+	/** Whether the Explorer right-click entry can be offered on this platform. */
+	shell_supported: boolean;
 }
 
 export interface MediaInfo {

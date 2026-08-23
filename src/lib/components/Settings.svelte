@@ -26,6 +26,7 @@
 	let {
 		settings,
 		status,
+		shellSupported,
 		presetsSourceUrl,
 		outputMode,
 		outputDir,
@@ -37,6 +38,7 @@
 	}: {
 		settings: EncodeSettings;
 		status: FfmpegStatus | null;
+		shellSupported: boolean;
 		presetsSourceUrl: string;
 		outputMode: OutputMode;
 		outputDir: string | null;
@@ -62,7 +64,7 @@
 
 	onMount(() => {
 		void (async () => {
-			shellMenu = await shellMenuStatus();
+			shellMenu = (await shellMenuStatus()).enabled;
 		})();
 		void (async () => {
 			version = await ffmpegVersion();
@@ -225,7 +227,7 @@
 		shellBusy = true;
 		shellError = null;
 		try {
-			shellMenu = await setShellMenu(enabled);
+			shellMenu = (await setShellMenu(enabled)).enabled;
 		} catch (error) {
 			shellError = String(error);
 		} finally {
@@ -356,14 +358,20 @@
 		little under the line absorbs that.
 	</p>
 
-	<div class="row">
-		<span class="name">Explorer right-click</span>
-		<button class="toggle" class:on={shellMenu} disabled={shellBusy} onclick={() => toggleShellMenu(!shellMenu)}>
-			{shellMenu ? 'Enabled' : 'Disabled'}
-		</button>
-	</div>
-	{#if shellError}
-		<p class="warn">{shellError}</p>
+	{#if shellSupported}
+		<div class="row">
+			<span class="name">Explorer right-click</span>
+			<button class="toggle" class:on={shellMenu} disabled={shellBusy} onclick={() => toggleShellMenu(!shellMenu)}>
+				{shellMenu ? 'Enabled' : 'Disabled'}
+			</button>
+		</div>
+		<p class="hint">
+			Adds “Compress for Discord” to videos and images. On Windows&nbsp;11 it sits under “Show
+			more options”.
+		</p>
+		{#if shellError}
+			<p class="warn">{shellError}</p>
+		{/if}
 	{/if}
 
 	<div class="row stack">

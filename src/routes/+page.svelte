@@ -25,6 +25,7 @@
 		onOpenFiles,
 		previewPair,
 		revealInFolder,
+		setShellMenu,
 		startup,
 		systemFfmpeg,
 		useSystemFfmpeg,
@@ -67,6 +68,7 @@
 	let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
 	let showSettings = $state(false);
+	let shellSupported = $state(false);
 
 	/* Where results go. "beside" writes next to the original, which is the
 	   default and needs no folder at all. */
@@ -184,28 +186,47 @@
 		await enqueue(Array.isArray(chosen) ? chosen : [chosen]);
 	}
 
-	async function install() {
+	async function install(addToExplorerMenu: boolean) {
 		installing = true;
 		installError = null;
 		try {
 			status = await installFfmpeg();
 		} catch (error) {
 			installError = String(error);
+			return;
 		} finally {
 			installing = false;
 		}
+		await addShellMenuIfWanted(addToExplorerMenu);
 	}
 
 	/** Offered only when startup found a usable build but stopped waiting on it. */
-	async function adoptSystem() {
+	async function adoptSystem(addToExplorerMenu: boolean) {
 		installing = true;
 		installError = null;
 		try {
 			status = await useSystemFfmpeg();
 		} catch (error) {
 			installError = String(error);
+			return;
 		} finally {
 			installing = false;
+		}
+		await addShellMenuIfWanted(addToExplorerMenu);
+	}
+
+	/**
+	 * Deliberately after FFmpeg is installed and verified, whichever way it
+	 * arrived. A right-click entry that opens an app which can't compress
+	 * anything is worse than no entry at all.
+	 */
+	async function addShellMenuIfWanted(wanted: boolean) {
+		if (!wanted || !shellSupported) return;
+		try {
+			await setShellMenu(true);
+		} catch {
+			// Never fail the install over this — it's undoable and retryable.
+			flash('Could not add the right-click entry. You can retry it in Settings.');
 		}
 	}
 
@@ -323,6 +344,8 @@
 			presets = initial.presets;
 			launchedWith = initial.pending_files;
 
+			shellSupported = initial.shell_supported;
+
 			const fallback = presets.presets.find((preset) => preset.default) ?? presets.presets[0];
 			if (fallback) {
 				selectedId = fallback.id;
@@ -390,6 +413,7 @@
 			error={installError}
 			busy={installing}
 			system={systemBuild}
+			{shellSupported}
 			onInstall={install}
 			onUseSystem={adoptSystem}
 		/>
@@ -429,6 +453,7 @@
 				<Settings
 					settings={{ ...options, target_bytes: limitBytes }}
 					{status}
+					{shellSupported}
 					presetsSourceUrl={presets?.source_url ?? ''}
 					{outputMode}
 					{outputDir}

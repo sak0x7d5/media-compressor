@@ -2,15 +2,24 @@
 	import type { InstallProgress, SystemBuild } from '$lib/ipc';
 	import { formatBytes } from '$lib/format';
 
-	let { progress, error, busy, system, onInstall, onUseSystem }: {
+	let { progress, error, busy, system, shellSupported, onInstall, onUseSystem }: {
 		progress: InstallProgress | null;
 		error: string | null;
 		busy: boolean;
 		/** What's on PATH, if anything. Null once nothing was found there. */
 		system: SystemBuild | null;
-		onInstall: () => void;
-		onUseSystem: () => void;
+		shellSupported: boolean;
+		/* Both ways of getting an FFmpeg take the checkbox, because the entry is
+		   only worth adding once there is something for it to open. */
+		onInstall: (addToExplorerMenu: boolean) => void;
+		onUseSystem: (addToExplorerMenu: boolean) => void;
 	} = $props();
+
+	/* Ticked by default. The entry is the whole point of installing this, it
+	   writes only under the current user, and Settings can undo it — so the
+	   cost of it being on and unwanted is one toggle, while the cost of it
+	   being off is nobody ever finding out the feature exists. */
+	let addToExplorerMenu = $state(true);
 
 	const fraction = $derived(
 		progress?.step === 'downloading' && progress.total_bytes > 0
@@ -81,12 +90,22 @@
 		</div>
 		<p class="status">{label}</p>
 	{:else}
+		{#if shellSupported}
+			<label class="opt">
+				<input type="checkbox" bind:checked={addToExplorerMenu} />
+				<span>
+					Add <strong>Compress for Discord</strong> to the right-click menu for videos and
+					images. On Windows&nbsp;11 it appears under “Show more options”.
+				</span>
+			</label>
+		{/if}
+
 		<div class="actions">
 			{#if system?.usable}
-				<button class="primary" onclick={onUseSystem}>Use the one I have</button>
-				<button class="secondary" onclick={onInstall}>Download a copy anyway</button>
+				<button class="primary" onclick={() => onUseSystem(addToExplorerMenu)}>Use the one I have</button>
+				<button class="secondary" onclick={() => onInstall(addToExplorerMenu)}>Download a copy anyway</button>
 			{:else}
-				<button class="primary" onclick={onInstall}>
+				<button class="primary" onclick={() => onInstall(addToExplorerMenu)}>
 					{error ? 'Try again' : 'Download FFmpeg'}
 				</button>
 			{/if}
@@ -168,6 +187,30 @@
 		font-size: 11px;
 		color: var(--text-muted);
 		margin: 0;
+	}
+
+	.opt {
+		display: flex;
+		align-items: flex-start;
+		gap: 9px;
+		margin: 0 0 18px;
+		font-size: 13px;
+		line-height: 1.55;
+		color: var(--text-secondary);
+		cursor: pointer;
+	}
+
+	.opt input {
+		/* The native checkbox sits on the text baseline rather than the cap
+		   height, so it needs nudging down to line up with the first line. */
+		margin: 2px 0 0;
+		accent-color: var(--accent);
+		flex: none;
+	}
+
+	.opt strong {
+		color: var(--text);
+		font-weight: 500;
 	}
 
 	button.primary {
