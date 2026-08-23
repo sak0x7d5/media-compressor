@@ -174,6 +174,15 @@ export type Disposition = 'keep' | 'replace';
  */
 export type OutputMode = 'beside' | 'folder' | 'ask' | 'replace';
 
+/**
+ * The Explorer right-click entry. `supported` is false off Windows, where the
+ * control is hidden rather than shown as a switch that can only fail.
+ */
+export interface ShellMenuStatus {
+	supported: boolean;
+	enabled: boolean;
+}
+
 export interface QueuedFile {
 	id: string;
 	input: string;
@@ -244,8 +253,9 @@ export const installUpdate = () => invoke<void>('install_update');
 
 export const previewPair = (before: string, after: string, atSeconds?: number) =>
 	invoke<PreviewPair>('preview_pair', { before, after, atSeconds });
-export const shellMenuStatus = () => invoke<boolean>('shell_menu_status');
-export const setShellMenu = (enabled: boolean) => invoke<boolean>('set_shell_menu', { enabled });
+export const shellMenuStatus = () => invoke<ShellMenuStatus>('shell_menu_status');
+export const setShellMenu = (enabled: boolean) =>
+	invoke<ShellMenuStatus>('set_shell_menu', { enabled });
 
 export const onOpenFiles = (handler: (paths: string[]) => void): Promise<UnlistenFn> =>
 	listen<string[]>(EVENT_OPEN_FILES, (message) => handler(message.payload));

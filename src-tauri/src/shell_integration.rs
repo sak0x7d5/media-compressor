@@ -5,7 +5,8 @@
 //! extension rather than under `*`, so the entry appears on videos and images
 //! and stays off every text file and spreadsheet on the machine.
 //!
-//! This is opt-in and reversible from Settings: [`register`] and
+//! This is opt-in and reversible: it is offered as a checkbox on the first-run
+//! screen and can be toggled afterwards in Settings. [`register`] and
 //! [`unregister`] are exact inverses, and uninstalling should call the latter.
 
 use thiserror::Error;
@@ -100,12 +101,12 @@ mod imp {
         Ok(())
     }
 
-    pub fn is_registered() -> bool {
+    pub fn registered_count() -> usize {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         EXTENSIONS
-            .first()
-            .map(|extension| hkcu.open_subkey(base_path(extension)).is_ok())
-            .unwrap_or(false)
+            .iter()
+            .filter(|extension| hkcu.open_subkey(base_path(extension)).is_ok())
+            .count()
     }
 }
 
@@ -121,12 +122,35 @@ mod imp {
         Err(ShellError::Unsupported)
     }
 
-    pub fn is_registered() -> bool {
-        false
+    pub fn registered_count() -> usize {
+        0
     }
 }
 
-pub use imp::{is_registered, register, unregister};
+pub use imp::{register, registered_count, unregister};
+
+/// Whether this build can offer the menu at all. The UI hides the option
+/// entirely rather than showing a control that can only ever fail.
+pub const fn is_supported() -> bool {
+    cfg!(windows)
+}
+
+/// How many extensions the menu covers when fully registered.
+pub fn extension_count() -> usize {
+    EXTENSIONS.len()
+}
+
+/// True only when *every* extension carries the entry.
+///
+/// A part-written menu — [`register`] failing midway through the loop — reads
+/// as "not registered" on purpose. That way the Settings toggle offers to
+/// enable it again, and doing so re-runs [`register`] over the whole list and
+/// repairs it. Reporting "on" for a half-written menu would leave the user
+/// looking at an enabled switch and a missing right-click entry, with nothing
+/// in the UI able to fix it.
+pub fn is_registered() -> bool {
+    registered_count() == extension_count()
+}
 
 #[cfg(test)]
 mod tests {
@@ -161,5 +185,26 @@ mod tests {
         let before = is_registered();
         let after = is_registered();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn the_menu_covers_at_least_one_extension() {
+        // `is_registered` compares a count against this; an empty list would
+        // make an unregistered menu report itself as fully registered.
+        assert!(extension_count() > 0);
+    }
+
+    #[test]
+    fn registration_is_all_or_nothing() {
+        assert_eq!(is_registered(), registered_count() == extension_count());
+        assert!(registered_count() <= extension_count());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_platform_without_the_registry_is_never_registered() {
+        assert!(!is_supported());
+        assert_eq!(registered_count(), 0);
+        assert!(!is_registered());
     }
 }

@@ -572,11 +572,32 @@ pub async fn preview_pair(
     .await
 }
 
+/// The state of the Explorer right-click entry.
+///
+/// `supported` and `enabled` travel together because the UI needs both to
+/// decide anything: an unsupported platform hides the control rather than
+/// showing one that can only fail.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ShellMenuStatus {
+    pub supported: bool,
+    pub enabled: bool,
+}
+
+fn shell_menu_snapshot() -> ShellMenuStatus {
+    ShellMenuStatus {
+        supported: shell_integration::is_supported(),
+        enabled: shell_integration::is_registered(),
+    }
+}
+
 /// Reads the registry, so it runs off the UI thread like everything else that
 /// touches the outside world.
 #[tauri::command]
-pub async fn shell_menu_status() -> bool {
-    tauri::async_runtime::spawn_blocking(shell_integration::is_registered).await.unwrap_or(false)
+pub async fn shell_menu_status() -> ShellMenuStatus {
+    tauri::async_runtime::spawn_blocking(shell_menu_snapshot).await.unwrap_or(ShellMenuStatus {
+        supported: shell_integration::is_supported(),
+        enabled: false,
+    })
 }
 
 /// Everything the first frame needs, in a single round trip.
@@ -613,8 +634,11 @@ pub fn ui_ready(app: AppHandle) {
 ///
 /// Writes only under HKEY_CURRENT_USER, so this never needs administrator
 /// rights and never affects other accounts on the machine.
+///
+/// The returned status is read back from the registry rather than echoing the
+/// requested value, so a write that half-succeeded reports itself as off.
 #[tauri::command]
-pub fn set_shell_menu(enabled: bool) -> Result<bool, String> {
+pub fn set_shell_menu(enabled: bool) -> Result<ShellMenuStatus, String> {
     let result = if enabled {
         shell_integration::register()
     } else {
@@ -622,7 +646,7 @@ pub fn set_shell_menu(enabled: bool) -> Result<bool, String> {
     };
 
     result.map_err(|e| e.to_string())?;
-    Ok(shell_integration::is_registered())
+    Ok(shell_menu_snapshot())
 }
 
 #[cfg(test)]
