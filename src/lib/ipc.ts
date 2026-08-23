@@ -6,6 +6,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 export const EVENT_JOB = 'job';
 export const EVENT_INSTALL = 'ffmpeg-install';
 export const EVENT_OPEN_FILES = 'open-files';
+export const EVENT_UPDATE = 'update-progress';
 
 export interface Preset {
 	id: string;
@@ -227,6 +228,11 @@ export interface UpdateInfo {
 	date: string | null;
 }
 
+/** How far an install has got. `installing` is often the last thing heard. */
+export type UpdateProgress =
+	| { step: 'downloading'; received_bytes: number; total_bytes: number | null }
+	| { step: 'installing' };
+
 export interface PreviewPair {
 	before: string;
 	after: string;
@@ -242,6 +248,30 @@ export const startup = () => invoke<Startup>('startup');
  * including the failing ones.
  */
 export const uiReady = () => invoke<void>('ui_ready');
+
+/** A group of changelog items — "Added", "Fixed". */
+export interface ChangeSection {
+	heading: string;
+	items: string[];
+}
+
+export interface Release {
+	version: string;
+	date?: string | null;
+	sections: ChangeSection[];
+}
+
+/** Changelog entries this profile has not been shown yet. */
+export interface WhatsNew {
+	from: string | null;
+	current: string;
+	releases: Release[];
+}
+
+export interface UpdatePrefs {
+	last_seen_version?: string | null;
+	auto_check: boolean;
+}
 
 export const listPresets = () => invoke<PresetFile>('list_presets');
 export const savePresets = (presets: PresetFile) => invoke<void>('save_presets', { presets });
@@ -283,6 +313,12 @@ export const refreshPresets = (force = false) =>
 export const checkForUpdate = () => invoke<UpdateInfo | null>('check_for_update');
 export const installUpdate = () => invoke<void>('install_update');
 
+export const whatsNew = () => invoke<WhatsNew | null>('whats_new');
+export const dismissWhatsNew = () => invoke<void>('dismiss_whats_new');
+export const changelog = () => invoke<Release[]>('changelog');
+export const updatePrefs = () => invoke<UpdatePrefs>('update_prefs');
+export const setAutoCheck = (enabled: boolean) =>
+	invoke<UpdatePrefs>('set_auto_check', { enabled });
 export const previewPair = (before: string, after: string, atSeconds?: number) =>
 	invoke<PreviewPair>('preview_pair', { before, after, atSeconds });
 export const shellMenuStatus = () => invoke<ShellMenuStatus>('shell_menu_status');
@@ -297,3 +333,6 @@ export const onJobEvent = (handler: (event: JobEvent) => void): Promise<Unlisten
 
 export const onInstallProgress = (handler: (event: InstallProgress) => void): Promise<UnlistenFn> =>
 	listen<InstallProgress>(EVENT_INSTALL, (message) => handler(message.payload));
+
+export const onUpdateProgress = (handler: (event: UpdateProgress) => void): Promise<UnlistenFn> =>
+	listen<UpdateProgress>(EVENT_UPDATE, (message) => handler(message.payload));

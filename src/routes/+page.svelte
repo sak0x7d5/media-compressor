@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { getVersion } from '@tauri-apps/api/app';
 	import { getCurrentWebview } from '@tauri-apps/api/webview';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import type { UnlistenFn } from '@tauri-apps/api/event';
@@ -11,14 +12,19 @@
 	import ResultCard from '$lib/components/ResultCard.svelte';
 	import Settings from '$lib/components/Settings.svelte';
 	import TargetPicker from '$lib/components/TargetPicker.svelte';
+	import UpdateBar from '$lib/components/UpdateBar.svelte';
+	import WhatsNew from '$lib/components/WhatsNew.svelte';
 
 	import { JobList, type Job } from '$lib/jobs.svelte';
+	import { Updater } from '$lib/updates.svelte';
 	import { formatBytes } from '$lib/format';
 	import {
 		addFiles,
 		cancelAll,
 		cancelJob,
+		changelog,
 		copyToClipboard,
+		dismissWhatsNew,
 		installFfmpeg,
 		onInstallProgress,
 		onJobEvent,
@@ -27,11 +33,14 @@
 		previewPair,
 		resumeQueue,
 		revealInFolder,
+		setAutoCheck,
 		setShellMenu,
 		startup,
 		systemFfmpeg,
 		useSystemFfmpeg,
 		uiReady,
+		updatePrefs,
+		whatsNew,
 		type EncodeSettings,
 		type Launch,
 		type FfmpegStatus,
@@ -39,7 +48,9 @@
 		type OutputMode,
 		type PresetFile,
 		type PreviewPair,
-		type SystemBuild
+		type Release,
+		type SystemBuild,
+		type UpdatePrefs
 	} from '$lib/ipc';
 
 	const CUSTOM = '__custom__';
@@ -56,7 +67,29 @@
 		'png', 'jpg', 'jpeg', 'webp', 'avif', 'bmp', 'tif', 'tiff'
 	];
 
+	/** How long to leave the window alone before asking about updates. Long
+	    enough that a launch which arrived with a file to compress is already
+	    encoding, short enough that nobody has closed the app yet. */
+	const UPDATE_CHECK_DELAY_MS = 4000;
+
 	const jobs = new JobList();
+	const updater = new Updater();
+	let checkTimer: ReturnType<typeof setTimeout> | undefined;
+
+	let version = $state('');
+	let prefs = $state<UpdatePrefs | null>(null);
+
+	/** The release-notes panel: the greeting after an update, or the full
+	    history when asked for from Settings. */
+	type NotesView = {
+		title: string;
+		subtitle?: string;
+		releases: Release[];
+		dismissLabel: string;
+		/** Closing it records the version as seen. Only the greeting does. */
+		acknowledge: boolean;
+	};
+	let notes = $state<NotesView | null>(null);
 
 	let status = $state<FfmpegStatus | null>(null);
 	/* Only consulted when there is nothing installed, to explain why an FFmpeg
@@ -177,6 +210,11 @@
 
 		preview = null;
 		openJobId = null;
+		// Work arriving beats anything being read. Closing the greeting here
+		// counts as having seen it — showing it again next launch, to someone
+		// who moved on to compressing a file, is nagging.
+		if (notes) closeNotes();
+
 		try {
 			jobs.add(
 				await addFiles(media, {
@@ -384,6 +422,31 @@
 		previewSeeking = false;
 	}
 
+	function closeNotes() {
+		// Only the post-update greeting moves the bookmark; browsing the history
+		// from Settings must not swallow notes the user has not been shown.
+		if (notes?.acknowledge) void dismissWhatsNew();
+		notes = null;
+	}
+
+	async function showReleaseNotes() {
+		try {
+			const releases = await changelog();
+			showSettings = false;
+			notes = { title: 'Release notes', releases, dismissLabel: 'Close', acknowledge: false };
+		} catch (error) {
+			flash(String(error));
+		}
+	}
+
+	async function toggleAutoCheck(enabled: boolean) {
+		try {
+			prefs = await setAutoCheck(enabled);
+		} catch (error) {
+			flash(String(error));
+		}
+	}
+
 	/**
 	 * Fill the UI in and show the window.
 	 *
@@ -429,6 +492,33 @@
 		// path for a cold start. Queued after the reveal so a folder prompt has
 		// a window to sit in front of.
 		if (launchedWith) await open_(launchedWith);
+
+		version = await getVersion();
+
+		// A launch that arrived with work to do is not the moment for release
+		// notes; the panel would cover the queue it was asked to run.
+		if (!launchedWith || launchedWith.files.length === 0) {
+			const news = await whatsNew();
+			if (news && news.releases.length > 0) {
+				notes = {
+					title: `What's new in ${news.current}`,
+					subtitle: news.from ? `Updated from ${news.from}.` : undefined,
+					releases: news.releases,
+					dismissLabel: 'Got it',
+					acknowledge: true
+				};
+			}
+		}
+
+		prefs = await updatePrefs();
+		// Never in a dev session. `pnpm tauri dev` runs from source, and an
+		// updater that decided the published release was newer would install
+		// a bundled copy over the top of what you are editing. Settings'
+		// "Check now" still works, so the path stays testable on purpose
+		// rather than by accident.
+		if (prefs.auto_check && !import.meta.env.DEV) {
+			checkTimer = setTimeout(() => void updater.check(), UPDATE_CHECK_DELAY_MS);
+		}
 	}
 
 	onMount(() => {
@@ -456,6 +546,7 @@
 
 		return () => {
 			clearTimeout(toastTimer);
+			clearTimeout(checkTimer);
 			for (const pending of unlisteners) {
 				void pending.then((unlisten) => unlisten());
 			}
@@ -475,6 +566,10 @@
 			onUseSystem={adoptSystem}
 		/>
 	{:else}
+		{#if updater.offering}
+			<UpdateBar {updater} blocked={hasWork} onDismiss={() => updater.dismiss()} />
+		{/if}
+
 		<header>
 			<span class="count">
 				{jobs.jobs.length === 0
@@ -503,7 +598,7 @@
 
 		<section
 			class="body"
-			class:empty={jobs.jobs.length === 0 && !showSettings}
+			class:empty={jobs.jobs.length === 0 && !showSettings && !notes}
 			class:fill={Boolean(preview) && !showSettings}
 		>
 			{#if showSettings}
@@ -518,10 +613,23 @@
 						outputMode = mode;
 						outputDir = dir;
 					}}
+					appVersion={version}
+					{updater}
+					autoCheck={prefs?.auto_check ?? true}
 					onChange={(patch) => (options = { ...options, ...patch })}
 					onPresets={(next) => (presets = next)}
 					onFfmpeg={(next) => (status = next)}
+					onAutoCheck={(enabled) => void toggleAutoCheck(enabled)}
+					onReleaseNotes={() => void showReleaseNotes()}
 					onClose={() => (showSettings = false)}
+				/>
+			{:else if notes}
+				<WhatsNew
+					title={notes.title}
+					subtitle={notes.subtitle}
+					releases={notes.releases}
+					dismissLabel={notes.dismissLabel}
+					onClose={closeNotes}
 				/>
 			{:else if preview}
 				<ComparePreview

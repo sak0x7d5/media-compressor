@@ -1,3 +1,4 @@
+pub mod changelog;
 pub mod clipboard;
 pub mod commands;
 pub mod ffmpeg;
@@ -159,8 +160,12 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Updating in place. The plugin verifies the downloaded installer
+        // against the public key in tauri.conf.json before running it, so a
+        // compromised release host still cannot ship anyone a binary.
         .plugin(tauri_plugin_updater::Builder::new().build())
-        // The updater needs this to relaunch into the version it just installed.
+        // Relaunching after an update. On Windows the NSIS installer usually
+        // closes the app itself, but the other platforms need this.
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             trace::mark("setup: entered (window and webview created)");
@@ -181,7 +186,6 @@ pub fn run() {
                 reveal_main_window(&handle);
             });
 
-            updates::check_in_background(app.handle());
 
             // Refresh the preset list in the background. This is a no-op unless
             // the user has configured a source URL, and a failure is never
@@ -224,6 +228,11 @@ pub fn run() {
             commands::refresh_presets,
             updates::check_for_update,
             updates::install_update,
+            commands::whats_new,
+            commands::dismiss_whats_new,
+            commands::changelog,
+            commands::update_prefs,
+            commands::set_auto_check,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

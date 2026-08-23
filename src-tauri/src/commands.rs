@@ -1,5 +1,6 @@
 //! The surface the frontend can call, and the events it receives back.
 
+use crate::changelog::{self, Release};
 use crate::clipboard;
 use crate::ffmpeg::acquire::{self, AcquireProgress};
 use crate::ffmpeg::encode::Speed;
@@ -16,6 +17,7 @@ use crate::queue::{
 use crate::shell_integration;
 use crate::strategy::plan::Options;
 use crate::strategy::{MediaInfo, SharpnessBias, Target, VideoCodec};
+use crate::updates::{self, UpdatePrefs};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -607,6 +609,84 @@ pub async fn preview_pair(
             .map_err(|e| e.to_string())
     })
     .await
+}
+
+/// The changelog entries this profile has not been shown yet.
+#[derive(Debug, Clone, Serialize)]
+pub struct WhatsNew {
+    /// The version they were on. `None` never reaches the frontend — a profile
+    /// with nothing recorded is shown nothing.
+    pub from: Option<String>,
+    pub current: String,
+    pub releases: Vec<Release>,
+}
+
+/// What changed since this profile last ran.
+///
+/// Returns `None` on a fresh install, on an unchanged version, and on a
+/// downgrade — and in the first of those cases quietly records the current
+/// version, so the *next* update has something to measure against. Without
+/// that, a new install would never see release notes again.
+#[tauri::command]
+pub fn whats_new(app: AppHandle, state: State<'_, AppState>) -> Option<WhatsNew> {
+    let current = app.package_info().version.to_string();
+    let prefs = updates::load(&state.config_dir);
+
+    let releases = updates::unseen(prefs.last_seen_version.as_deref(), &current, &changelog::releases());
+    if releases.is_empty() {
+        // Nothing to say, so the bookmark can move now rather than waiting on a
+        // panel the user is never going to see.
+        mark_seen(&state.config_dir, &current);
+        return None;
+    }
+
+    Some(WhatsNew { from: prefs.last_seen_version, current, releases })
+}
+
+/// Acknowledge the What's new panel.
+///
+/// Deliberately separate from reading it: quitting without closing the panel
+/// should leave the notes waiting next launch, not swallow them.
+#[tauri::command]
+pub fn dismiss_whats_new(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let current = app.package_info().version.to_string();
+    updates::save(
+        &state.config_dir,
+        &UpdatePrefs { last_seen_version: Some(current), ..updates::load(&state.config_dir) },
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn mark_seen(config_dir: &std::path::Path, version: &str) {
+    let prefs = updates::load(config_dir);
+    if prefs.last_seen_version.as_deref() == Some(version) {
+        return;
+    }
+    // A profile directory that cannot be written is not worth failing a launch
+    // over; the cost is being told about this version again next time.
+    let _ = updates::save(
+        config_dir,
+        &UpdatePrefs { last_seen_version: Some(version.to_string()), ..prefs },
+    );
+}
+
+/// The full release history, compiled into the binary. Needs no network.
+#[tauri::command]
+pub fn changelog() -> Vec<Release> {
+    changelog::releases()
+}
+
+#[tauri::command]
+pub fn update_prefs(state: State<'_, AppState>) -> UpdatePrefs {
+    updates::load(&state.config_dir)
+}
+
+/// Turn the check-on-launch behaviour on or off.
+#[tauri::command]
+pub fn set_auto_check(state: State<'_, AppState>, enabled: bool) -> Result<UpdatePrefs, String> {
+    let prefs = UpdatePrefs { auto_check: enabled, ..updates::load(&state.config_dir) };
+    updates::save(&state.config_dir, &prefs).map_err(|e| e.to_string())?;
+    Ok(prefs)
 }
 
 /// The state of the Explorer right-click entry.

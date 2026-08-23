@@ -91,6 +91,35 @@ jobs:
             [ "$found" = "$tagged" ] || echo "::warning::$file says $found, not $tagged"
           done
 
+      # Renaming the repository is cheap; forgetting that the endpoint is baked
+      # into the binary is not. Without this, a rename ships an app that checks
+      # a URL nothing publishes to, and the failure is invisible — installs
+      # simply stop being offered updates.
+      - name: Check the updater endpoint points at this repository
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          endpoint=$(node -p "require('./src-tauri/tauri.conf.json').plugins.updater.endpoints[0]")
+          expected="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/latest.json"
+          if [ "$endpoint" != "$expected" ]; then
+            echo "::error::tauri.conf.json checks $endpoint, but this repository publishes to $expected."
+            exit 1
+          fi
+
+      # The same words the app shows in its What's new panel, by construction
+      # rather than by someone remembering to paste them. Tauri copies the
+      # release body into latest.json, which is what the update prompt shows.
+      - name: Release notes from the changelog
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: notes
+        shell: bash
+        run: |
+          {
+            echo 'body<<CHANGELOG_ENTRY'
+            node scripts/notes.mjs "$GITHUB_REF_NAME"
+            echo 'CHANGELOG_ENTRY'
+          } >> "$GITHUB_OUTPUT"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -105,7 +134,7 @@ jobs:
           # after whatever branch the run started from.
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('Media Compressor {0}', github.ref_name) || '' }}
-          releaseBody: 'Installed copies will offer this update automatically.'
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: true
           prerelease: false
 

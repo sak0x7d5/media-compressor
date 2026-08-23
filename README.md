@@ -301,28 +301,59 @@ after unpacking rather than left as another 90 MB of someone's disk.
 
 ## Releases and updating
 
-The app can update itself: it asks the release host what the newest version is
-and installs it, so nobody has to go and fetch an installer again. Every update
-must carry a signature made with this project's private key, and the matching
-public key is compiled into the binary — a compromised download host cannot push
-anything the app will accept.
+Nobody reinstalls this app to get a new version of it. A few seconds after
+launch it asks the release page whether anything newer exists; if so a one-line
+bar appears with the version number and a link to what changed. Clicking
+**Update** downloads the installer, runs it, and the app comes back on the new
+version. Nothing downloads before you say so, and the bar's **Update** button
+stays disabled while the queue is busy — installing closes the app, and losing
+a half-finished encode to a version bump is a bad trade.
 
-Publishing a release is a version bump and a tag:
+The launch check is one HTTPS request to the release page and can be turned off
+in Settings, where there is also a **Check now** button and the full release
+history.
+
+**Nothing is trusted because it came from the right URL.** Every installer is
+signed with a private key that lives on the maintainer's machine, and the
+matching public key is compiled into the app. A download whose signature does
+not verify is discarded rather than run — so a compromised release host, or
+anyone who talks the app into fetching from somewhere else, still cannot get a
+binary executed.
+
+### What's new
+
+`CHANGELOG.md` is compiled into the binary — `include_str!`, not a resource
+file, so it cannot go missing. On the first launch of a version you haven't
+seen, its entries are shown once. A fresh install shows nothing: a changelog is
+a poor greeting for someone who has never used the app.
+
+That same file is the source for the notes on the GitHub release and in the
+update prompt, lifted out by `pnpm notes` during the release build. Write
+entries for the person deciding whether to click Update, not for the commit
+log. Changes that have not shipped yet go under `## [Unreleased]`, which the
+app ignores until the heading becomes a version.
+
+### Cutting a release
 
 ```bash
-# The version in these three files is what the release actually contains.
-#   src-tauri/tauri.conf.json   ← the one that reaches latest.json
-#   src-tauri/Cargo.toml
-#   package.json
+pnpm version:set 0.2.0
+```
+
+That writes the version to `package.json`, `Cargo.toml`, `Cargo.lock` and
+`tauri.conf.json` together, and refuses to run without a changelog entry for it
+— rename `[Unreleased]` to the version first. The version in `tauri.conf.json`
+is the one that reaches `latest.json`, so the four have to agree. Then:
+
+```bash
 git commit -am "release v0.2.0"
 git tag v0.2.0 && git push origin main v0.2.0
 ```
 
-That triggers a workflow which builds the installer, signs it, and creates a
-**draft** release including a `latest.json` describing the new version. The
-draft is where release notes get written; GitHub serves nothing from it until
-it is published from the Releases page. Once it is, installed copies find the
-`latest.json` and offer the update. Until then the in-app check reports that
+That triggers a workflow which runs the tests, builds the installer, signs it,
+and creates a **draft** release with the changelog entry as its notes and a
+`latest.json` describing the new version. GitHub serves nothing from a draft
+until it is published from the Releases page. Once it is, installed copies find
+the `latest.json` and offer the update. Until then the in-app check reports that
 the server answered but had no release to offer, which is exactly right.
 
 The tag has to match the version in `tauri.conf.json`, and the workflow stops if
@@ -330,19 +361,24 @@ it doesn't. That version — not the tag — is what `latest.json` advertises, s
 tagging `v0.2.0` on a tree still saying `0.1.0` would publish a release every
 installed copy reads as "nothing newer here". It is the one mistake this process
 can make silently, which is why it is checked rather than documented and hoped
-for.
+for. The workflow also refuses if the updater endpoint compiled into the app
+does not point at the repository doing the publishing — renaming the repository
+is cheap, and forgetting that URL would ship an app that quietly stops being
+offered updates.
 
 Running the workflow by hand from the Actions tab builds the installer without
-publishing anything, which is the way to check it works before committing to a
-tag.
+publishing anything, and keeps it as a downloadable artifact, which is the way
+to check it works — or to get a runnable build of any branch — before
+committing to a tag.
 
-**One thing must be true before the first release:**
+**One thing must be true before a release can be built:**
 
 The **`TAURI_SIGNING_PRIVATE_KEY` secret must be set** to the contents of the
 private key file, under Settings → Secrets and variables → Actions. The key
-lives outside this repository by design and must never be committed; losing it
-means existing installs can never be updated again, because they will reject
-anything signed with a different key.
+lives outside this repository by design and must never be committed. Back it up
+somewhere you will still have it in two years: losing it means every existing
+install is stranded, because a new key produces signatures old builds will
+correctly refuse, and the only way out is asking everyone to reinstall by hand.
 
 The repository also has to be public, so an installed copy can fetch
 `latest.json` without a login — that part is already done.
@@ -462,6 +498,8 @@ src-tauri/src/
 ├── images.rs       binary-search quality targeting
 ├── pipeline.rs     probe → plan → encode → verify → correct
 ├── queue.rs        serial video, pause/resume, per-job cancellation
+├── changelog.rs    CHANGELOG.md, compiled in and parsed (pure)
+├── updates.rs      self-updating, and which entries this profile has been shown
 └── commands.rs     the surface the UI calls
 ```
 
