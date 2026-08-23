@@ -23,6 +23,7 @@
 		onInstallProgress,
 		onJobEvent,
 		onOpenFiles,
+		type Launch,
 		previewPair,
 		revealInFolder,
 		setShellMenu,
@@ -336,13 +337,13 @@
 	 * with a window, and one that answered must not be shown mid-populate.
 	 */
 	async function boot() {
-		let launchedWith: string[] = [];
+		let launchedWith: Launch | null = null;
 
 		try {
 			const initial = await startup();
 			status = initial.ffmpeg;
 			presets = initial.presets;
-			launchedWith = initial.pending_files;
+			launchedWith = initial.launch;
 
 			shellSupported = initial.shell_supported;
 
@@ -371,7 +372,7 @@
 		// Files handed to us on the command line — the Explorer context menu
 		// path for a cold start. Queued after the reveal so a folder prompt has
 		// a window to sit in front of.
-		if (launchedWith.length > 0) await enqueue(launchedWith);
+		if (launchedWith && launchedWith.files.length > 0) await enqueue(launchedWith.files);
 	}
 
 	onMount(() => {
@@ -380,7 +381,7 @@
 		unlisteners.push(onJobEvent((event) => jobs.apply(event)));
 		unlisteners.push(onInstallProgress((event) => (installProgress = event)));
 		// A second launch forwards its files here rather than opening a window.
-		unlisteners.push(onOpenFiles((paths) => void enqueue(paths)));
+		unlisteners.push(onOpenFiles((launch) => void enqueue(launch.files)));
 
 		// Tauri delivers OS drag-and-drop to the webview rather than as DOM
 		// events, so the browser's own dragover/drop never fire here.

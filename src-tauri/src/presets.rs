@@ -11,6 +11,7 @@
 //! screen edits. Corruption at that layer falls back to the built-in list
 //! rather than leaving the app with no targets at all.
 
+use crate::shell_menu::{format_bytes, MenuItem};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -59,6 +60,59 @@ impl PresetFile {
     /// The preset marked `default`, or the first one.
     pub fn default_preset(&self) -> Option<&Preset> {
         self.presets.iter().find(|preset| preset.default).or_else(|| self.presets.first())
+    }
+
+    /// The Explorer submenu for this list.
+    ///
+    /// The default preset is promoted to the top level so the common case is
+    /// two clicks rather than three; everything else nests under its group,
+    /// mirroring the optgroups in the app's own target picker. The last entry
+    /// carries no size and simply opens the app.
+    pub fn shell_menu(&self) -> Vec<MenuItem> {
+        let mut items: Vec<MenuItem> = Vec::new();
+
+        if let Some(preset) = self.default_preset() {
+            items.push(MenuItem {
+                key: format!("{:02}default", items.len()),
+                label: format!(
+                    "{} {} · {}",
+                    preset.group,
+                    preset.label,
+                    format_bytes(preset.bytes)
+                ),
+                target_bytes: Some(preset.bytes),
+                children: Vec::new(),
+            });
+        }
+
+        for (index, (name, members)) in self.grouped().into_iter().enumerate() {
+            let children = members
+                .into_iter()
+                .enumerate()
+                .map(|(position, preset)| MenuItem {
+                    key: format!("{position:02}item"),
+                    label: format!("{} · {}", preset.label, format_bytes(preset.bytes)),
+                    target_bytes: Some(preset.bytes),
+                    children: Vec::new(),
+                })
+                .collect();
+
+            items.push(MenuItem {
+                key: format!("{:02}group{index:02}", items.len()),
+                label: name,
+                target_bytes: None,
+                children,
+            });
+        }
+
+        items.push(MenuItem {
+            key: format!("{:02}custom", items.len()),
+            label: "Choose a size…".to_string(),
+            target_bytes: None,
+            children: Vec::new(),
+        });
+
+        items
     }
 
     /// Presets in display order, grouped, with group order preserved from the
@@ -211,6 +265,93 @@ pub fn refresh(config_dir: &Path, force: bool) -> Result<Option<PresetFile>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Explorer sorts submenu entries by key name, so the keys — not the order
+    /// of the vector — are what actually decides what the user sees first.
+    #[test]
+    fn menu_keys_sort_into_the_order_they_were_built_in() {
+        let menu = PresetFile::built_in().shell_menu();
+
+        let mut sorted: Vec<&str> = menu.iter().map(|item| item.key.as_str()).collect();
+        let built: Vec<&str> = sorted.clone();
+        sorted.sort_unstable();
+
+        assert_eq!(sorted, built, "alphabetical order must match the intended order");
+    }
+
+    #[test]
+    fn sibling_keys_are_unique_at_every_level() {
+        fn check(items: &[MenuItem]) {
+            let mut seen: Vec<&str> = Vec::new();
+            for item in items {
+                assert!(!seen.contains(&item.key.as_str()), "duplicate key {}", item.key);
+                seen.push(&item.key);
+                check(&item.children);
+            }
+        }
+        check(&PresetFile::built_in().shell_menu());
+    }
+
+    #[test]
+    fn the_default_preset_is_promoted_to_the_top_level() {
+        let presets = PresetFile::built_in();
+        let menu = presets.shell_menu();
+        let default = presets.default_preset().expect("the bundled list has a default");
+
+        let first = menu.first().expect("the menu is never empty");
+        assert_eq!(first.target_bytes, Some(default.bytes));
+        assert!(first.label.contains(&default.group), "got {}", first.label);
+        assert!(!first.is_submenu(), "the promoted entry must be clickable");
+    }
+
+    #[test]
+    fn the_last_entry_opens_the_app_without_choosing_a_size() {
+        let menu = PresetFile::built_in().shell_menu();
+        let last = menu.last().expect("the menu is never empty");
+
+        assert_eq!(last.target_bytes, None);
+        assert!(!last.is_submenu(), "it must be clickable, not a submenu");
+    }
+
+    #[test]
+    fn every_group_becomes_a_submenu_of_clickable_sizes() {
+        let presets = PresetFile::built_in();
+        let menu = presets.shell_menu();
+
+        for (name, members) in presets.grouped() {
+            let group = menu
+                .iter()
+                .find(|item| item.label == name)
+                .unwrap_or_else(|| panic!("no submenu for {name}"));
+
+            assert!(group.is_submenu());
+            assert_eq!(group.target_bytes, None, "a submenu carries no command");
+            assert_eq!(group.children.len(), members.len());
+
+            for child in &group.children {
+                assert!(child.target_bytes.is_some(), "{} has no size", child.label);
+                assert!(!child.is_submenu(), "the menu is only two levels deep");
+            }
+        }
+    }
+
+    /// An empty list would otherwise produce a "Shrink" entry that opens onto
+    /// nothing at all.
+    #[test]
+    fn a_list_with_no_presets_still_offers_a_way_in() {
+        let empty = PresetFile {
+            version: 1,
+            updated: String::new(),
+            presets: Vec::new(),
+            source_url: None,
+            last_refreshed: None,
+        };
+
+        let menu = empty.shell_menu();
+        assert_eq!(menu.len(), 1);
+        assert_eq!(menu[0].target_bytes, None);
+        assert!(!menu[0].is_submenu());
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir()

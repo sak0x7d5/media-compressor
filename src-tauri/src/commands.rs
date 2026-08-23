@@ -38,8 +38,8 @@ pub struct AppState {
     pub cache_dir: PathBuf,
     pub config_dir: PathBuf,
     pub work_root: PathBuf,
-    /// Paths this process was launched with, consumed once by [`startup`].
-    pub pending_files: Mutex<Vec<String>>,
+    /// What this process was launched with, consumed once by [`startup`].
+    pub pending: Mutex<crate::Launch>,
     next_id: AtomicU64,
 }
 
@@ -80,9 +80,7 @@ impl AppState {
             cache_dir,
             config_dir,
             work_root,
-            pending_files: Mutex::new(crate::collect_file_args(
-                &std::env::args().collect::<Vec<_>>(),
-            )),
+            pending: Mutex::new(crate::parse_launch(&std::env::args().collect::<Vec<_>>())),
             next_id: AtomicU64::new(1),
         }
     }
@@ -124,10 +122,10 @@ impl FfmpegStatus {
 pub struct Startup {
     pub ffmpeg: FfmpegStatus,
     pub presets: PresetFile,
-    /// Paths this launch was handed on the command line — the Explorer context
-    /// menu on a cold start. Consumed here, so this is the only place that
-    /// will ever report them.
-    pub pending_files: Vec<String>,
+    /// What this launch was handed on the command line — the Explorer context
+    /// menu on a cold start, and the size its submenu entry stands for.
+    /// Consumed here, so this is the only place that will ever report it.
+    pub launch: crate::Launch,
     /// Whether this build can offer the Explorer entry at all. A constant, so it
     /// rides along for free; the first-run screen needs it for its checkbox
     /// before anything else has been asked.
@@ -217,7 +215,9 @@ pub fn list_presets(state: State<'_, AppState>) -> PresetFile {
 
 #[tauri::command]
 pub fn save_presets(state: State<'_, AppState>, presets: PresetFile) -> Result<(), String> {
-    crate::presets::save(&state.config_dir, &presets).map_err(|e| e.to_string())
+    crate::presets::save(&state.config_dir, &presets).map_err(|e| e.to_string())?;
+    resync_shell_menu(&state.config_dir);
+    Ok(())
 }
 
 /// Point the app at a URL to keep the preset list current, or `None` to stop.
@@ -239,6 +239,7 @@ pub fn set_presets_url(state: State<'_, AppState>, url: Option<String>) -> Resul
     // Changing the source invalidates when we last checked it.
     presets.last_refreshed = None;
     presets::save(&state.config_dir, &presets).map_err(|e| e.to_string())?;
+    resync_shell_menu(&state.config_dir);
 
     Ok(presets)
 }
@@ -247,9 +248,19 @@ pub fn set_presets_url(state: State<'_, AppState>, url: Option<String>) -> Resul
 #[tauri::command]
 pub async fn refresh_presets(app: AppHandle, force: bool) -> Result<Option<PresetFile>, String> {
     let config_dir = app.state::<AppState>().config_dir.clone();
-    tauri::async_runtime::spawn_blocking(move || presets::refresh(&config_dir, force))
-        .await
-        .map_err(|e| format!("refresh task failed: {e}"))?
+    let refreshed = tauri::async_runtime::spawn_blocking(move || {
+        let result = presets::refresh(&config_dir, force);
+        // A refresh that changed the list must change the menu with it, or the
+        // right-click sizes silently drift from the ones the app offers.
+        if matches!(result, Ok(Some(_))) {
+            resync_shell_menu(&config_dir);
+        }
+        result
+    })
+    .await
+    .map_err(|e| format!("refresh task failed: {e}"))?;
+
+    refreshed
 }
 
 /// The located binaries, or the error the frontend shows when there are none.
@@ -618,7 +629,7 @@ pub fn startup(state: State<'_, AppState>) -> Startup {
     Startup {
         ffmpeg: FfmpegStatus::of(state.tools.lock().unwrap().as_ref()),
         presets: presets::load(&state.config_dir),
-        pending_files: std::mem::take(&mut *state.pending_files.lock().unwrap()),
+        launch: std::mem::take(&mut *state.pending.lock().unwrap()),
         shell_supported: shell_integration::is_supported(),
     }
 }
@@ -643,15 +654,29 @@ pub fn ui_ready(app: AppHandle) {
 /// The returned status is read back from the registry rather than echoing the
 /// requested value, so a write that half-succeeded reports itself as off.
 #[tauri::command]
-pub fn set_shell_menu(enabled: bool) -> Result<ShellMenuStatus, String> {
+pub fn set_shell_menu(state: State<'_, AppState>, enabled: bool) -> Result<ShellMenuStatus, String> {
     let result = if enabled {
-        shell_integration::register()
+        let presets = presets::load(&state.config_dir);
+        shell_integration::register(&presets.shell_menu())
     } else {
         shell_integration::unregister()
     };
 
     result.map_err(|e| e.to_string())?;
     Ok(shell_menu_snapshot())
+}
+
+/// Rewrite the submenu after the preset list changes.
+///
+/// Silent by design, and a no-op unless the menu is currently registered: a
+/// preset edit should not start writing to the registry for someone who never
+/// asked for the Explorer entry, and a failure here must not fail the edit.
+fn resync_shell_menu(config_dir: &std::path::Path) {
+    if !shell_integration::is_registered() {
+        return;
+    }
+    let presets = presets::load(config_dir);
+    let _ = shell_integration::register(&presets.shell_menu());
 }
 
 #[cfg(test)]

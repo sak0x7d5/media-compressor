@@ -7,6 +7,7 @@ pub mod presets;
 pub mod preview;
 pub mod queue;
 pub mod shell_integration;
+pub mod shell_menu;
 pub mod strategy;
 pub mod trace;
 pub mod updates;
@@ -73,16 +74,65 @@ fn mark_revealed(app: &AppHandle) {
     }
 }
 
-/// Pull real file paths out of a command line, ignoring flags and anything that
-/// is not actually on disk.
-pub fn collect_file_args<S: AsRef<str>>(argv: &[S]) -> Vec<String> {
-    argv.iter()
-        .skip(1)
-        .map(|arg| arg.as_ref())
-        .filter(|arg| !arg.starts_with('-'))
-        .filter(|arg| std::path::Path::new(arg).is_file())
-        .map(|arg| arg.to_string())
-        .collect()
+/// What a launch was asked to do.
+///
+/// The submenu entries pass `--target <bytes>` alongside the paths, so a launch
+/// carries both the files and, when the user picked a size from the menu rather
+/// than opening the app cold, the size they picked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Launch {
+    pub files: Vec<String>,
+    pub target_bytes: Option<u64>,
+}
+
+impl Launch {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+}
+
+/// Pull the files and the requested target out of a command line.
+///
+/// Anything that is not a flag we recognise and not a file on disk is dropped,
+/// so a stray argument can never enqueue something that is not there. An
+/// unparseable or absurd `--target` is ignored rather than fatal: the user
+/// still gets their files, just at the default size.
+pub fn parse_launch<S: AsRef<str>>(argv: &[S]) -> Launch {
+    /// A target below this cannot hold any encodable output, and above it the
+    /// value is meaningless as an upload limit. Either way it is not something
+    /// we wrote into the registry.
+    const MIN_TARGET: u64 = 10_000;
+    const MAX_TARGET: u64 = 100_000_000_000;
+
+    let mut launch = Launch::default();
+    let mut arguments = argv.iter().skip(1).map(|argument| argument.as_ref());
+
+    while let Some(argument) = arguments.next() {
+        let value = match argument.strip_prefix("--target") {
+            // `--target=N`
+            Some(rest) if rest.starts_with('=') => Some(rest[1..].to_string()),
+            // `--target N`
+            Some(rest) if rest.is_empty() => arguments.next().map(|next| next.to_string()),
+            _ => None,
+        };
+
+        if let Some(value) = value {
+            launch.target_bytes = value
+                .parse::<u64>()
+                .ok()
+                .filter(|bytes| (MIN_TARGET..=MAX_TARGET).contains(bytes));
+            continue;
+        }
+
+        if argument.starts_with('-') {
+            continue;
+        }
+        if std::path::Path::new(argument).is_file() {
+            launch.files.push(argument.to_string());
+        }
+    }
+
+    launch
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -90,11 +140,11 @@ pub fn run() {
     tauri::Builder::default()
         // Single-instance must be registered first: a second launch has to be
         // intercepted before it builds a window of its own. Without it, every
-        // right-click "Compress for Discord" opens another copy of the app.
+        // right-click "Shrink" opens another copy of the app.
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            let files = collect_file_args(&argv);
-            if !files.is_empty() {
-                let _ = app.emit(EVENT_OPEN_FILES, files);
+            let launch = parse_launch(&argv);
+            if !launch.is_empty() {
+                let _ = app.emit(EVENT_OPEN_FILES, launch);
             }
 
             // A second launch is a request to look at the app, so it brings
@@ -177,18 +227,19 @@ mod tests {
 
     #[test]
     fn the_executable_itself_is_never_treated_as_an_input() {
-        let files = collect_file_args(&["media-compressor.exe"]);
-        assert!(files.is_empty());
+        let launch = parse_launch(&["media-compressor.exe"]);
+        assert!(launch.is_empty());
+        assert_eq!(launch.target_bytes, None);
     }
 
     #[test]
     fn flags_and_missing_paths_are_ignored() {
-        let files = collect_file_args(&[
+        let launch = parse_launch(&[
             "media-compressor.exe",
             "--some-flag",
             "C:/definitely/not/here.mp4",
         ]);
-        assert!(files.is_empty(), "got {files:?}");
+        assert!(launch.is_empty(), "got {launch:?}");
     }
 
     /// The window starts hidden, so whichever of the frontend signal and the
@@ -215,15 +266,69 @@ mod tests {
 
     #[test]
     fn real_files_are_collected() {
+        let file = scratch_file("argv");
+        let path = file.to_string_lossy().to_string();
+
+        let launch = parse_launch(&["media-compressor.exe".to_string(), path.clone()]);
+
+        assert_eq!(launch.files, vec![path]);
+        assert_eq!(launch.target_bytes, None);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_target_is_read_in_either_spelling() {
+        let file = scratch_file("target");
+        let path = file.to_string_lossy().to_string();
+
+        for argv in [
+            vec!["app".to_string(), "--target".into(), "20000000".into(), path.clone()],
+            vec!["app".to_string(), "--target=20000000".into(), path.clone()],
+        ] {
+            let launch = parse_launch(&argv);
+            assert_eq!(launch.target_bytes, Some(20_000_000), "for {argv:?}");
+            assert_eq!(launch.files, vec![path.clone()], "for {argv:?}");
+        }
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// The registry is user-editable, so the value we get back may not be the
+    /// one we wrote. A nonsense size must cost the user their target, not their
+    /// files.
+    #[test]
+    fn an_unusable_target_is_dropped_but_the_files_survive() {
+        let file = scratch_file("bad-target");
+        let path = file.to_string_lossy().to_string();
+
+        for bad in ["0", "12", "not-a-number", "999999999999999"] {
+            let launch = parse_launch(&[
+                "app".to_string(),
+                "--target".into(),
+                bad.to_string(),
+                path.clone(),
+            ]);
+            assert_eq!(launch.target_bytes, None, "{bad} should not be accepted");
+            assert_eq!(launch.files, vec![path.clone()], "{bad} lost the files");
+        }
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// `--target` at the very end has nothing to consume, and must not swallow
+    /// a path that isn't there or panic reaching for one.
+    #[test]
+    fn a_dangling_target_flag_is_harmless() {
+        let launch = parse_launch(&["app", "--target"]);
+        assert_eq!(launch.target_bytes, None);
+        assert!(launch.is_empty());
+    }
+
+    fn scratch_file(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join("media-compressor-tests");
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join(format!("argv-{}.mp4", std::process::id()));
+        let file = dir.join(format!("{tag}-{}.mp4", std::process::id()));
         std::fs::write(&file, b"x").unwrap();
-
-        let path = file.to_string_lossy().to_string();
-        let files = collect_file_args(&["media-compressor.exe".to_string(), path.clone()]);
-
-        assert_eq!(files, vec![path]);
-        let _ = std::fs::remove_file(&file);
+        file
     }
 }

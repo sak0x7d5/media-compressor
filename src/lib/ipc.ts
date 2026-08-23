@@ -41,12 +41,21 @@ export interface SystemBuild {
 	missing_encoders: string[];
 }
 
+/**
+ * What a launch was asked to do. `target_bytes` is set when the user picked a
+ * size straight from the Explorer submenu instead of opening the app cold.
+ */
+export interface Launch {
+	files: string[];
+	target_bytes: number | null;
+}
+
 /** Everything the first frame needs, fetched in one round trip. */
 export interface Startup {
 	ffmpeg: FfmpegStatus;
 	presets: PresetFile;
-	/** Paths this launch was handed on the command line. */
-	pending_files: string[];
+	/** What this launch was handed on the command line. */
+	launch: Launch;
 	/** Whether the Explorer right-click entry can be offered on this platform. */
 	shell_supported: boolean;
 }
@@ -185,6 +194,15 @@ export interface ShellMenuStatus {
 	enabled: boolean;
 }
 
+/**
+ * What a launch was asked to do. `target_bytes` is set when the user picked a
+ * size straight from the Explorer submenu instead of opening the app cold.
+ */
+export interface Launch {
+	files: string[];
+	target_bytes: number | null;
+}
+
 export interface QueuedFile {
 	id: string;
 	input: string;
@@ -259,8 +277,8 @@ export const shellMenuStatus = () => invoke<ShellMenuStatus>('shell_menu_status'
 export const setShellMenu = (enabled: boolean) =>
 	invoke<ShellMenuStatus>('set_shell_menu', { enabled });
 
-export const onOpenFiles = (handler: (paths: string[]) => void): Promise<UnlistenFn> =>
-	listen<string[]>(EVENT_OPEN_FILES, (message) => handler(message.payload));
+export const onOpenFiles = (handler: (launch: Launch) => void): Promise<UnlistenFn> =>
+	listen<Launch>(EVENT_OPEN_FILES, (message) => handler(message.payload));
 
 export const onJobEvent = (handler: (event: JobEvent) => void): Promise<UnlistenFn> =>
 	listen<JobEvent>(EVENT_JOB, (message) => handler(message.payload));
