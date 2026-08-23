@@ -191,8 +191,28 @@ replaced file, because there is no longer a "before" to read.
 ## Explorer right-click
 
 Offered as a ticked checkbox on the first-run screen, and toggleable afterwards
-under Settings → Explorer right-click. It puts **Compress for Discord** on
-videos and images.
+under Settings → Explorer right-click. It puts a **Shrink** cascade on videos
+and images:
+
+```
+Shrink  >   Discord Free · 20.0 MB
+            Discord      >   Free · 20.0 MB
+            Email        >   Gmail attachment · 25.0 MB
+            Messaging    >   ...
+            Choose a size…
+```
+
+Not "Compress": Windows 11 already puts its own **Compress to...** — which
+makes a ZIP — in the same menu, and two neighbouring entries opening with the
+same verb is a coin flip for the reader.
+
+The submenu is generated from the preset list rather than hardcoded, so editing
+a size in Settings or picking one up from a remote refresh rewrites the menu to
+match. The default preset is promoted to the top level so the common case is two
+clicks; the last entry opens the app without choosing a size. Each entry passes
+`--target <bytes>`, and a value that fails to parse or is implausible as an
+upload limit is ignored rather than fatal — you still get your files, just at the
+default size.
 
 Registration writes under `HKEY_CURRENT_USER\Software\Classes`, so it needs no
 administrator rights and touches no other account on the machine. It attaches
@@ -201,13 +221,22 @@ spreadsheet, and it hangs off `SystemFileAssociations` rather than a ProgID so
 it survives the user changing their default video player. Selecting a dozen
 clips invokes the app once with all twelve rather than opening twelve copies.
 
+All twenty extensions point at **one** shared definition of the submenu through
+`ExtendedSubCommandsKey`, so adding a preset rewrites a single key rather than
+twenty copies of the same tree. Nesting uses an empty `SubCommands` plus a
+`shell` subkey, which keeps the whole thing per-user; a semicolon-separated
+list there would instead resolve against the machine-wide `CommandStore`, which
+needs administrator rights.
+
 **On Windows 11 the entry appears under "Show more options"**, not in the short
 menu that opens first. Nothing about the registry can change that: the short
 menu only lists `IExplorerCommand` handlers shipped in a signed MSIX package.
 It is the same reason 7-Zip's entry lives down there.
 
-`register` and `unregister` are exact inverses, and a part-written menu reports
-itself as disabled — so re-enabling it rewrites the whole list and repairs the
+`register` and `unregister` are exact inverses, and both trees are rebuilt from
+scratch on every registration rather than merged into — a shrunken preset list
+would otherwise leave orphaned entries behind. A part-written menu reports
+itself as disabled, so re-enabling it rewrites the whole list and repairs the
 gap.
 
 ---

@@ -23,7 +23,6 @@
 		onInstallProgress,
 		onJobEvent,
 		onOpenFiles,
-		type Launch,
 		previewPair,
 		revealInFolder,
 		setShellMenu,
@@ -32,6 +31,7 @@
 		useSystemFfmpeg,
 		uiReady,
 		type EncodeSettings,
+		type Launch,
 		type FfmpegStatus,
 		type InstallProgress,
 		type OutputMode,
@@ -176,6 +176,25 @@
 		} catch (error) {
 			flash(String(error));
 		}
+	}
+
+	/**
+	 * Act on a launch: adopt the size the Explorer submenu asked for, then queue
+	 * its files. The size is applied first so the jobs are created against it
+	 * rather than against whatever the picker happened to be showing.
+	 */
+	async function open_(launch: Launch) {
+		if (launch.files.length === 0) return;
+
+		if (launch.target_bytes !== null) {
+			// Prefer the preset that names this size, so the picker reads
+			// "Discord Free" rather than a bare custom number.
+			const match = presets?.presets.find((preset) => preset.bytes === launch.target_bytes);
+			selectedId = match ? match.id : CUSTOM;
+			customBytes = launch.target_bytes;
+		}
+
+		await enqueue(launch.files);
 	}
 
 	async function browse() {
@@ -372,7 +391,7 @@
 		// Files handed to us on the command line — the Explorer context menu
 		// path for a cold start. Queued after the reveal so a folder prompt has
 		// a window to sit in front of.
-		if (launchedWith && launchedWith.files.length > 0) await enqueue(launchedWith.files);
+		if (launchedWith) await open_(launchedWith);
 	}
 
 	onMount(() => {
@@ -381,7 +400,7 @@
 		unlisteners.push(onJobEvent((event) => jobs.apply(event)));
 		unlisteners.push(onInstallProgress((event) => (installProgress = event)));
 		// A second launch forwards its files here rather than opening a window.
-		unlisteners.push(onOpenFiles((launch) => void enqueue(launch.files)));
+		unlisteners.push(onOpenFiles((launch) => void open_(launch)));
 
 		// Tauri delivers OS drag-and-drop to the webview rather than as DOM
 		// events, so the browser's own dragover/drop never fire here.
