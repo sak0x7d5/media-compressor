@@ -239,6 +239,16 @@ would otherwise leave orphaned entries behind. A part-written menu reports
 itself as disabled, so re-enabling it rewrites the whole list and repairs the
 gap.
 
+Uninstalling removes the keys too, from `src-tauri/nsis/hooks.nsh`, rather than
+by calling `unregister` — by uninstall time there may be no working copy of the
+app left to run it, and someone who never opened Settings would be left with the
+keys regardless. That means the extension list exists in two places, so tests in
+`shell_integration.rs` read the `.nsh` file and fail if the two drift apart; the
+failure mode otherwise is silent, a menu entry pointing at an executable that no
+longer exists. The hook assumes the per-user install NSIS defaults to: under
+`installMode: "perMachine"` the uninstaller runs elevated, `HKCU` resolves to the
+administrator's hive, and it would clean nothing.
+
 ---
 
 ## FFmpeg

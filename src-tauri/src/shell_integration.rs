@@ -316,7 +316,7 @@ mod tests {
     fn the_uninstaller_removes_the_shared_submenu_key() {
         assert!(
             UNINSTALL_HOOK.contains(MENU_KEY),
-            "nsis/hooks.nsh must delete Software\\\\Classes\\\\{MENU_KEY}"
+            "nsis/hooks.nsh must delete Software\\Classes\\{MENU_KEY}"
         );
     }
 
