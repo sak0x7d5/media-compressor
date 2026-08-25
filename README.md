@@ -314,10 +314,12 @@ PATH, and downloads its own if there is nothing there.
 
 ### On a machine that has never built this
 
-Requires Rust (stable), Node 20+, pnpm 10.33+, and the MSVC C++ build tools on
-Windows. pnpm older than that refuses `pnpm-workspace.yaml`, which this project
-uses for settings rather than for workspaces, so it has no `packages` field.
-Rather than installing those by hand:
+Requires Rust (stable), Node 20+, pnpm 10.33+, and a C toolchain with the system
+webview headers. There is a script per platform that installs whatever of that
+is missing, then installs dependencies and starts the app.
+
+**Windows** — installs through winget, and additionally the MSVC C++ build tools
+and the WebView2 runtime:
 
 ```powershell
 New-Item -ItemType Directory -Force -Path "$HOME\code" | Out-Null
@@ -327,20 +329,33 @@ Set-Location media-compressor
 powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 ```
 
-The repository is private, so the clone asks you to sign in to GitHub; Git for
-Windows opens a browser to do it and remembers the answer. The `-ExecutionPolicy
-Bypass` is for that one run only — Windows refuses unsigned scripts by default
-and this changes nothing permanently.
+`-ExecutionPolicy Bypass` is for that one run only — Windows refuses unsigned
+scripts by default and this changes nothing permanently.
 
-`setup.ps1` installs whatever is missing through winget — Node, pnpm, Rust, the
-C++ build tools, the WebView2 runtime — then installs dependencies and starts
-the app. It skips anything already present, so re-running it is harmless, and
-`-NoStart` sets the machine up without launching anything.
+**macOS and Linux** — Xcode command line tools on macOS, and the WebKitGTK
+development headers through apt, dnf or pacman on Linux:
 
-On macOS or Linux there is no script: install Node 20+, pnpm and rustup from the
-usual places, add Xcode command line tools (macOS) or `libwebkit2gtk-4.1-dev`,
-`build-essential` and `librsvg2-dev` (Debian/Ubuntu), then run the two commands
-above. Windows is the only platform this app is released for.
+```bash
+mkdir -p ~/code && cd ~/code
+git clone https://github.com/sak0x7d5/media-compressor.git
+cd media-compressor
+./scripts/setup.sh
+```
+
+Either script skips anything already present, so re-running it is harmless.
+`-NoStart` (Windows) or `--no-start` (Unix) sets the machine up without
+launching anything.
+
+Two things they handle that are easy to hit by hand. The repository is private,
+so the clone asks you to sign in to GitHub. And a pnpm older than 10.33 rejects
+this project's `pnpm-workspace.yaml` — it holds settings rather than a workspace,
+so it has no `packages` field — which the scripts fix by upgrading, and, if an
+older copy still wins PATH, by calling the newer one directly and telling you
+where each one lives.
+
+Windows is the only platform the app is *released* for; the Mica window effect
+and the NSIS installer are Windows-only. It builds and runs on the other two for
+development.
 
 Tests:
 
