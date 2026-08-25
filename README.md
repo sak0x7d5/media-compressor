@@ -318,10 +318,17 @@ Requires Rust (stable), Node 20+, pnpm, and the MSVC C++ build tools on Windows.
 Rather than installing those by hand:
 
 ```powershell
-git clone https://github.com/sak0x7d5/media-compressor
-cd media-compressor
-./scripts/setup.ps1
+New-Item -ItemType Directory -Force -Path "$HOME\code" | Out-Null
+Set-Location "$HOME\code"
+git clone https://github.com/sak0x7d5/media-compressor.git
+Set-Location media-compressor
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 ```
+
+The repository is private, so the clone asks you to sign in to GitHub; Git for
+Windows opens a browser to do it and remembers the answer. The `-ExecutionPolicy
+Bypass` is for that one run only — Windows refuses unsigned scripts by default
+and this changes nothing permanently.
 
 `setup.ps1` installs whatever is missing through winget — Node, pnpm, Rust, the
 C++ build tools, the WebView2 runtime — then installs dependencies and starts
