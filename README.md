@@ -314,7 +314,9 @@ PATH, and downloads its own if there is nothing there.
 
 ### On a machine that has never built this
 
-Requires Rust (stable), Node 20+, pnpm, and the MSVC C++ build tools on Windows.
+Requires Rust (stable), Node 20+, pnpm 10.33+, and the MSVC C++ build tools on
+Windows. pnpm older than that refuses `pnpm-workspace.yaml`, which this project
+uses for settings rather than for workspaces, so it has no `packages` field.
 Rather than installing those by hand:
 
 ```powershell

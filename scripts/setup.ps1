@@ -27,6 +27,11 @@ $ErrorActionPreference = 'Stop'
 # Node 20 is the floor Vite 6 and SvelteKit 2 support.
 $MinimumNodeMajor = 20
 
+# pnpm-workspace.yaml here carries settings and no `packages` field, which older
+# pnpm rejects outright as an invalid workspace. This is the version the file was
+# authored against; anything below it fails before installing a single package.
+$MinimumPnpmVersion = [version]'10.33.0'
+
 function Write-Step  { param([string]$Message) Write-Host "`n==> $Message" -ForegroundColor Cyan }
 function Write-Have  { param([string]$Message) Write-Host "    $Message" -ForegroundColor DarkGray }
 function Write-Note  { param([string]$Message) Write-Host "    $Message" -ForegroundColor Yellow }
@@ -76,6 +81,11 @@ function Install-WithWinget {
     if ($Verify -and -not (Test-Have $Verify)) {
         throw "$Label did not install cleanly (winget exit code $code). Install it by hand and run this script again."
     }
+}
+
+function Get-PnpmVersion {
+    if (-not (Test-Have 'pnpm')) { return $null }
+    try { return [version]((& pnpm --version).Trim()) } catch { return $null }
 }
 
 function Get-NodeMajorVersion {
@@ -172,12 +182,21 @@ if ($nodeMajor -ge $MinimumNodeMajor) {
 }
 
 Write-Step 'Checking pnpm'
-if (Test-Have 'pnpm') {
-    Write-Have "pnpm $(& pnpm --version) is already installed."
+$pnpmVersion = Get-PnpmVersion
+if ($pnpmVersion -and $pnpmVersion -ge $MinimumPnpmVersion) {
+    Write-Have "pnpm $pnpmVersion is fine."
 } else {
-    & npm install --global pnpm
+    if ($pnpmVersion) {
+        Write-Note "pnpm $pnpmVersion predates $MinimumPnpmVersion and cannot read this project's settings; upgrading it."
+    }
+    & npm install --global 'pnpm@latest'
     if ($LASTEXITCODE -ne 0) { throw 'Could not install pnpm through npm.' }
     Update-SessionPath
+
+    $pnpmVersion = Get-PnpmVersion
+    if (-not $pnpmVersion -or $pnpmVersion -lt $MinimumPnpmVersion) {
+        throw "pnpm is still $pnpmVersion after upgrading, and this project needs $MinimumPnpmVersion or newer. An older copy earlier on PATH is the usual cause — check with (Get-Command pnpm -All)."
+    }
 }
 
 Write-Step 'Checking Rust'
