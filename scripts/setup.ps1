@@ -112,7 +112,33 @@ function Test-WebView2 {
 
 # ---------------------------------------------------------------------------
 
-$projectRoot = Split-Path -Parent $PSScriptRoot
+# $PSScriptRoot is empty when the file is pasted into a shell rather than run,
+# so fall back to wherever the shell already is.
+$projectRoot = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { (Get-Location).Path }
+
+# Being in the wrong directory is the single most likely way to arrive here, and
+# every tool downstream reports it as something else — pnpm blames a missing
+# package.json, cargo blames a missing manifest. Say it once, plainly.
+if (-not (Test-Path (Join-Path $projectRoot 'package.json'))) {
+    throw @"
+This is not the Media Compressor checkout:
+
+    $projectRoot
+
+There is no package.json in it, which means the repository is somewhere else or
+has not been cloned yet. From a folder you keep code in:
+
+    git clone https://github.com/sak0x7d5/media-compressor
+    cd media-compressor
+    ./scripts/setup.ps1
+
+If you have already cloned it and just cannot find it, this lists any copy under
+your user folder:
+
+    Get-ChildItem `$HOME -Filter media-compressor -Recurse -Directory -Depth 4 -ErrorAction SilentlyContinue
+"@
+}
+
 Set-Location $projectRoot
 
 Write-Host 'Media Compressor — development setup' -ForegroundColor White
@@ -125,6 +151,13 @@ winget is not available, so this script cannot install anything.
 Install "App Installer" from the Microsoft Store (or update Windows), reopen
 PowerShell, and run this script again.
 '@
+}
+
+Write-Step 'Checking Git'
+if (Test-Have 'git') {
+    Write-Have "$(& git --version) is already installed."
+} else {
+    Install-WithWinget -Id 'Git.Git' -Label 'Git' -Verify 'git'
 }
 
 Write-Step 'Checking Node'

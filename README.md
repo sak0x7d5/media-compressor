@@ -296,7 +296,11 @@ build from before this was added has to install once manually.
 
 ### Running it
 
+From inside the checkout — both commands need the project folder as the working
+directory, not your home folder:
+
 ```bash
+cd media-compressor
 pnpm install
 pnpm tauri dev
 ```
