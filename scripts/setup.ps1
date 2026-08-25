@@ -84,8 +84,24 @@ function Install-WithWinget {
 }
 
 function Get-PnpmVersion {
-    if (-not (Test-Have 'pnpm')) { return $null }
-    try { return [version]((& pnpm --version).Trim()) } catch { return $null }
+    param([string]$Command = 'pnpm')
+    if ($Command -eq 'pnpm' -and -not (Test-Have 'pnpm')) { return $null }
+    if ($Command -ne 'pnpm' -and -not (Test-Path $Command)) { return $null }
+    try { return [version]((& $Command --version 2>$null).Trim()) } catch { return $null }
+}
+
+# Reports every pnpm the shell can see, so a version that refuses to move can be
+# attributed to the copy that is actually winning rather than guessed at.
+function Show-PnpmCandidates {
+    $found = @(Get-Command pnpm -All -ErrorAction SilentlyContinue |
+        Where-Object { $_.Source } |
+        Select-Object -ExpandProperty Source -Unique)
+    if (-not $found) { return }
+    Write-Note 'pnpm is installed in more than one place; PATH order decides which one runs:'
+    foreach ($path in $found) {
+        $version = Get-PnpmVersion -Command $path
+        Write-Note ("  {0}  ({1})" -f $path, $(if ($version) { "v$version" } else { 'unreadable' }))
+    }
 }
 
 function Get-NodeMajorVersion {
@@ -182,22 +198,46 @@ if ($nodeMajor -ge $MinimumNodeMajor) {
 }
 
 Write-Step 'Checking pnpm'
+
+# Everything downstream goes through this rather than through the bare name, so
+# a stale pnpm winning PATH cannot decide what the rest of the script runs.
+$pnpm = 'pnpm'
 $pnpmVersion = Get-PnpmVersion
-if ($pnpmVersion -and $pnpmVersion -ge $MinimumPnpmVersion) {
-    Write-Have "pnpm $pnpmVersion is fine."
-} else {
+
+if (-not ($pnpmVersion -and $pnpmVersion -ge $MinimumPnpmVersion)) {
     if ($pnpmVersion) {
         Write-Note "pnpm $pnpmVersion predates $MinimumPnpmVersion and cannot read this project's settings; upgrading it."
     }
     & npm install --global 'pnpm@latest'
     if ($LASTEXITCODE -ne 0) { throw 'Could not install pnpm through npm.' }
     Update-SessionPath
-
     $pnpmVersion = Get-PnpmVersion
-    if (-not $pnpmVersion -or $pnpmVersion -lt $MinimumPnpmVersion) {
-        throw "pnpm is still $pnpmVersion after upgrading, and this project needs $MinimumPnpmVersion or newer. An older copy earlier on PATH is the usual cause — check with (Get-Command pnpm -All)."
+}
+
+# npm installed a current pnpm, but installers that put themselves earlier on
+# PATH — corepack shims, pnpm's own standalone installer, Volta, Scoop — keep
+# answering to the name. Address the new one directly instead of fighting over
+# PATH, which is the user's to reorder, not this script's.
+if (-not ($pnpmVersion -and $pnpmVersion -ge $MinimumPnpmVersion)) {
+    $npmPrefix = (& npm prefix --global 2>$null)
+    $candidate = if ($npmPrefix) { Join-Path $npmPrefix.Trim() 'pnpm.cmd' } else { $null }
+    $candidateVersion = if ($candidate) { Get-PnpmVersion -Command $candidate } else { $null }
+
+    if ($candidateVersion -and $candidateVersion -ge $MinimumPnpmVersion) {
+        Write-Note "The pnpm on PATH is still $pnpmVersion, so this run uses the newer one directly:"
+        Write-Note "  $candidate"
+        Show-PnpmCandidates
+        Write-Note 'Until the older copy is removed, or its folder moved after the npm one in PATH,'
+        Write-Note 'typing `pnpm` by hand will keep getting the old version.'
+        $pnpm = $candidate
+        $pnpmVersion = $candidateVersion
+    } else {
+        Show-PnpmCandidates
+        throw "pnpm is still $pnpmVersion after upgrading, and this project needs $MinimumPnpmVersion or newer."
     }
 }
+
+Write-Have "Using pnpm $pnpmVersion."
 
 Write-Step 'Checking Rust'
 if (Test-Have 'cargo') {
@@ -233,7 +273,7 @@ if (Test-WebView2) {
 }
 
 Write-Step 'Installing project dependencies'
-& pnpm install
+& $pnpm install
 if ($LASTEXITCODE -ne 0) { throw 'pnpm install failed.' }
 
 if (-not (Test-Have 'ffmpeg')) {
@@ -249,4 +289,4 @@ if ($NoStart) {
 Write-Step 'Starting the app (pnpm tauri dev)'
 Write-Have 'The first Rust build takes several minutes. Later ones are seconds.'
 Write-Have 'Ctrl+C stops it. Edits to the UI reload on save.'
-& pnpm tauri dev
+& $pnpm tauri dev
