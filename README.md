@@ -430,6 +430,27 @@ process. The integration tests in `src-tauri/tests/end_to_end.rs` run real
 encodes; they generate their own source clips rather than checking a binary into
 the repo, and skip with a printed note when FFmpeg can't be found.
 
+Building an installer additionally needs a signing key. `createUpdaterArtifacts`
+is on and a public key is compiled into the binary, so Tauri refuses to produce
+updater artifacts it cannot sign — `pnpm tauri build` fails with "a public key
+has been found, but no private key" until one is present:
+
+```powershell
+pnpm tauri signer generate --ci -p "" -w "$env:USERPROFILE\.tauri\mc-dev.key"
+
+$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content "$env:USERPROFILE\.tauri\mc-dev.key" -Raw
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
+
+pnpm tauri build
+```
+
+A key generated this way does not match the public key compiled in, so the
+installer it produces can be installed by hand but can never be *offered* to an
+existing install as an update — which is exactly what a local build is for. The
+real key lives outside this repository and belongs only in CI. Neither key is
+ever committed; keeping the file outside the working tree is the simplest way to
+guarantee that.
+
 ```
 src-tauri/src/
 ├── strategy/       budget, resolution ladder, CRF-vs-two-pass decision (pure)
