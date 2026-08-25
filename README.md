@@ -294,12 +294,40 @@ build from before this was added has to install once manually.
 
 ## Development
 
-Requires Rust (stable), Node 20+, pnpm, and the MSVC C++ build tools on Windows.
+### Running it
 
 ```bash
 pnpm install
 pnpm tauri dev
 ```
+
+That builds the Rust side, starts Vite, and opens the app. The first build takes
+several minutes because Rust compiles every dependency from scratch; after that
+it is seconds, and edits to the UI reload without a restart. Ctrl+C stops it.
+
+FFmpeg is not a prerequisite for running it — a debug build uses whatever is on
+PATH, and downloads its own if there is nothing there.
+
+### On a machine that has never built this
+
+Requires Rust (stable), Node 20+, pnpm, and the MSVC C++ build tools on Windows.
+Rather than installing those by hand:
+
+```powershell
+git clone https://github.com/sak0x7d5/media-compressor
+cd media-compressor
+./scripts/setup.ps1
+```
+
+`setup.ps1` installs whatever is missing through winget — Node, pnpm, Rust, the
+C++ build tools, the WebView2 runtime — then installs dependencies and starts
+the app. It skips anything already present, so re-running it is harmless, and
+`-NoStart` sets the machine up without launching anything.
+
+On macOS or Linux there is no script: install Node 20+, pnpm and rustup from the
+usual places, add Xcode command line tools (macOS) or `libwebkit2gtk-4.1-dev`,
+`build-essential` and `librsvg2-dev` (Debian/Ubuntu), then run the two commands
+above. Windows is the only platform this app is released for.
 
 Tests:
 
