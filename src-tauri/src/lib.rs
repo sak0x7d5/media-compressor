@@ -188,6 +188,12 @@ pub fn run() {
             // allowed to affect startup — a stale limit still compresses files.
             std::thread::spawn(move || {
                 let _ = presets::refresh(&config_dir, false);
+
+                // Then bring the Explorer menu in line with whatever that left
+                // behind, and with this build. Off the UI thread because it
+                // touches the registry, and after the refresh so a list that
+                // just changed is the one the menu is built from.
+                commands::resync_shell_menu(&config_dir);
             });
 
             trace::mark("setup: done, waiting on the frontend");

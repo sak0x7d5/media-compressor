@@ -666,12 +666,17 @@ pub fn set_shell_menu(state: State<'_, AppState>, enabled: bool) -> Result<Shell
     Ok(shell_menu_snapshot())
 }
 
-/// Rewrite the submenu after the preset list changes.
+/// Rewrite the submenu to match the current presets and executable.
 ///
 /// Silent by design, and a no-op unless the menu is currently registered: a
 /// preset edit should not start writing to the registry for someone who never
 /// asked for the Explorer entry, and a failure here must not fail the edit.
-fn resync_shell_menu(config_dir: &std::path::Path) {
+///
+/// Also run once at startup. The command line embeds this executable's absolute
+/// path, and the menu's shape changes between versions, so an install that
+/// moved or upgraded would otherwise keep the old layout — or point at a path
+/// that no longer exists — until someone thought to toggle Settings off and on.
+pub(crate) fn resync_shell_menu(config_dir: &std::path::Path) {
     if !shell_integration::is_registered() {
         return;
     }
