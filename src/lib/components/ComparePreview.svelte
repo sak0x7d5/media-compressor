@@ -1,7 +1,24 @@
 <script lang="ts">
-	import type { PreviewPair } from '$lib/ipc';
+	import { untrack } from 'svelte';
 
-	let { pair, onClose }: { pair: PreviewPair; onClose: () => void } = $props();
+	import type { PreviewPair } from '$lib/ipc';
+	import { formatDuration } from '$lib/format';
+
+	let {
+		pair,
+		duration = 0,
+		seeking = false,
+		onSeek,
+		onClose
+	}: {
+		pair: PreviewPair;
+		/* Zero for a still, which has no timeline to move along. */
+		duration?: number;
+		/* A frame for a newer timestamp is still being extracted. */
+		seeking?: boolean;
+		onSeek: (seconds: number) => void;
+		onClose: () => void;
+	} = $props();
 
 	/* A wipe rather than side-by-side: compression artefacts are only visible
 	   when the same pixels sit in the same place, and two panels put them
@@ -48,11 +65,74 @@
 	   over the wrong image. */
 	const showBefore = $derived(split > 12);
 	const showAfter = $derived(split < 88);
+
+	/* One frame is one sample of a decision that plays out over the whole clip:
+	   the midpoint can be a locked-off shot while every artefact worth seeing
+	   is in a pan ten seconds later. The timeline moves both frames together,
+	   which is the only way to go looking for the damage rather than hoping it
+	   landed under the default.
+
+	   It stops just short of the end because seeking to exactly the duration
+	   lands past the final frame and comes back empty. */
+	const lastFrame = $derived(Math.max(0, duration - 0.1));
+	const scrubbable = $derived(lastFrame > 0);
+
+	/* The backend picks the midpoint when the comparison opens; from then on
+	   this owns the position, so the knob stays under the pointer instead of
+	   snapping back to whichever reply landed last. */
+	let at = $state(untrack(() => pair.at_seconds));
+	let scrubbing = $state(false);
+	let track: HTMLDivElement | undefined = $state();
+
+	const elapsed = $derived(scrubbable ? (at / lastFrame) * 100 : 0);
+
+	function seekTo(seconds: number) {
+		const next = Math.max(0, Math.min(lastFrame, seconds));
+		if (next === at) return;
+		at = next;
+		onSeek(next);
+	}
+
+	function seekFromPointer(clientX: number) {
+		if (!track) return;
+		const box = track.getBoundingClientRect();
+		if (box.width === 0) return;
+		seekTo(((clientX - box.left) / box.width) * lastFrame);
+	}
+
+	/* Whole seconds, because the neighbouring frame is the same picture: the
+	   point of moving at all is to reach a different shot. */
+	function onTimeKeydown(event: KeyboardEvent) {
+		const step = event.shiftKey ? 10 : 1;
+		switch (event.key) {
+			case 'ArrowLeft':
+				seekTo(at - step);
+				break;
+			case 'ArrowRight':
+				seekTo(at + step);
+				break;
+			case 'Home':
+				seekTo(0);
+				break;
+			case 'End':
+				seekTo(lastFrame);
+				break;
+			default:
+				return;
+		}
+		event.preventDefault();
+	}
 </script>
 
 <svelte:window
-	onpointermove={(event) => dragging && setFromPointer(event.clientX)}
-	onpointerup={() => (dragging = false)}
+	onpointermove={(event) => {
+		if (dragging) setFromPointer(event.clientX);
+		if (scrubbing) seekFromPointer(event.clientX);
+	}}
+	onpointerup={() => {
+		dragging = false;
+		scrubbing = false;
+	}}
 />
 
 <div class="wrap">
@@ -99,6 +179,33 @@
 			<div class="grip"></div>
 		</div>
 	</div>
+
+	{#if scrubbable}
+		<div class="timeline">
+			<span class="time" class:pending={seeking}>{formatDuration(at)}</span>
+			<div
+				class="track"
+				bind:this={track}
+				onpointerdown={(event) => {
+					scrubbing = true;
+					seekFromPointer(event.clientX);
+				}}
+				onkeydown={onTimeKeydown}
+				role="slider"
+				tabindex="0"
+				aria-label="Preview time"
+				aria-orientation="horizontal"
+				aria-valuemin={0}
+				aria-valuemax={Math.round(lastFrame)}
+				aria-valuenow={Math.round(at)}
+				aria-valuetext={`${formatDuration(at)} of ${formatDuration(duration)}`}
+			>
+				<div class="elapsed" style:width={`${elapsed}%`}></div>
+				<div class="knob" style:left={`${elapsed}%`}></div>
+			</div>
+			<span class="total">{formatDuration(duration)}</span>
+		</div>
+	{/if}
 </div>
 
 <style>
@@ -232,5 +339,80 @@
 		border-radius: 50%;
 		background: rgba(255, 255, 255, 0.9);
 		box-shadow: 0 1px 6px rgba(0, 0, 0, 0.5);
+	}
+
+	.timeline {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		flex: none;
+		margin-top: 12px;
+	}
+
+	.time,
+	.total {
+		font-family: var(--font-mono);
+		font-size: 11px;
+		line-height: 1;
+		flex: none;
+	}
+
+	.time {
+		color: var(--text-secondary);
+	}
+
+	/* Muted while the next frame is still being extracted. What is on screen is
+	   the previous timestamp until it lands, and saying so costs a colour
+	   rather than a spinner that would blink on every step. */
+	.time.pending {
+		color: var(--text-muted);
+	}
+
+	.total {
+		color: var(--text-muted);
+	}
+
+	.track {
+		position: relative;
+		flex: 1;
+		height: 4px;
+		border-radius: 2px;
+		background: var(--bg-track);
+		cursor: pointer;
+		touch-action: none;
+	}
+
+	.track:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 5px;
+	}
+
+	/* Four pixels of bar is not a drag target. The hit area is the height of a
+	   row; the bar itself stays thin. */
+	.track::before {
+		content: '';
+		position: absolute;
+		inset: -10px 0;
+	}
+
+	.elapsed {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		left: 0;
+		border-radius: 2px;
+		background: var(--accent);
+	}
+
+	.knob {
+		position: absolute;
+		top: 50%;
+		width: 11px;
+		height: 11px;
+		margin: -5.5px 0 0 -5.5px;
+		border-radius: 50%;
+		background: rgba(255, 255, 255, 0.92);
+		box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+		pointer-events: none;
 	}
 </style>

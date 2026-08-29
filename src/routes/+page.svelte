@@ -12,7 +12,7 @@
 	import Settings from '$lib/components/Settings.svelte';
 	import TargetPicker from '$lib/components/TargetPicker.svelte';
 
-	import { JobList } from '$lib/jobs.svelte';
+	import { JobList, type Job } from '$lib/jobs.svelte';
 	import { formatBytes } from '$lib/format';
 	import {
 		addFiles,
@@ -78,6 +78,14 @@
 	let outputDir = $state<string | null>(null);
 	let preview = $state<PreviewPair | null>(null);
 	let previewBusy = $state(false);
+	/* The clip the open comparison came from, kept so that scrubbing can go
+	   back to the same two files without depending on the job still being
+	   the one on screen. Duration is zero for a still, which has no
+	   timeline. */
+	let previewSource = $state<{ input: string; output: string; duration: number } | null>(null);
+	let previewSeeking = $state(false);
+	let seekToken = 0;
+	let seekTimer: ReturnType<typeof setTimeout> | undefined;
 
 	let options = $state<Omit<EncodeSettings, 'target_bytes'>>({
 		safety_margin: 0.95,
@@ -215,15 +223,62 @@
 		}
 	}
 
-	async function compare(input: string, output: string) {
+	async function compare(job: Job) {
 		previewBusy = true;
 		try {
-			preview = await previewPair(input, output);
+			preview = await previewPair(job.input, job.output);
+			previewSource = {
+				input: job.input,
+				output: job.output,
+				duration: job.outcome?.kind === 'video' ? job.outcome.info.duration_secs : 0
+			};
 		} catch (error) {
 			flash(String(error));
 		} finally {
 			previewBusy = false;
 		}
+	}
+
+	/**
+	 * Move the comparison to another moment in the clip.
+	 *
+	 * Each seek is two ffmpeg runs against files on disk, so it waits for the
+	 * drag to settle rather than firing per pixel — a swap mid-drag is a frame
+	 * nobody looks at anyway.
+	 */
+	function seekPreview(seconds: number) {
+		clearTimeout(seekTimer);
+		if (previewSource) previewSeeking = true;
+		seekTimer = setTimeout(() => void runSeek(seconds), 150);
+	}
+
+	/* Replies can land out of order, so a stale one is dropped rather than
+	   allowed to paint over a newer frame. */
+	async function runSeek(seconds: number) {
+		const source = previewSource;
+		if (!source) {
+			previewSeeking = false;
+			return;
+		}
+
+		const token = ++seekToken;
+		previewSeeking = true;
+		try {
+			const pair = await previewPair(source.input, source.output, seconds);
+			if (token === seekToken) preview = pair;
+		} catch (error) {
+			if (token === seekToken) flash(String(error));
+		} finally {
+			if (token === seekToken) previewSeeking = false;
+		}
+	}
+
+	function closePreview() {
+		clearTimeout(seekTimer);
+		seekToken++;
+		preview = null;
+		previewSource = null;
+		previewSeeking = false;
 	}
 
 	/**
@@ -362,7 +417,13 @@
 					onClose={() => (showSettings = false)}
 				/>
 			{:else if preview}
-				<ComparePreview pair={preview} onClose={() => (preview = null)} />
+				<ComparePreview
+					pair={preview}
+					duration={previewSource?.duration ?? 0}
+					seeking={previewSeeking}
+					onSeek={seekPreview}
+					onClose={closePreview}
+				/>
 			{:else if detailJob}
 				<ResultCard
 					job={detailJob}
@@ -370,7 +431,7 @@
 					busy={previewBusy}
 					onCopy={copy}
 					onReveal={(path) => void revealInFolder(path)}
-					onCompare={() => compare(detailJob.input, detailJob.output)}
+					onCompare={() => compare(detailJob)}
 					onClear={() => {
 						jobs.remove(detailJob.id);
 						openJobId = null;
