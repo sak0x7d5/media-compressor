@@ -63,6 +63,43 @@
 		event.preventDefault();
 	}
 
+	/* Both halves of the wipe have to be the same moment, and two <img>
+	   elements handed new sources in the same update do not paint in the same
+	   update: they decode independently and each appears when it is ready. A
+	   click hides this — one swap, then quiet — but dragging across frames
+	   already in hand swaps continuously, and the seam sits there showing one
+	   side a moment or two ahead of the other. A comparison that is not of the
+	   same instant is worse than a slow one; it is quietly wrong.
+
+	   So a pair is decoded off screen and only becomes visible once both sides
+	   are ready, which is what makes the swap atomic. Until then the previous
+	   pair stays up, still matched. */
+	let shown = $state(untrack(() => pair));
+	let generation = 0;
+
+	function decoded(src: string): Promise<unknown> {
+		const image = new Image();
+		image.src = src;
+		/* A source that will not decode is still shown: the alternative is a
+		   comparison stuck on a stale frame with nothing to explain it. */
+		return image.decode().catch(() => undefined);
+	}
+
+	$effect(() => {
+		const next = pair;
+		if (untrack(() => shown) === next) return;
+
+		const token = ++generation;
+		void Promise.all([decoded(next.before), decoded(next.after)]).then(() => {
+			// A newer pair started decoding while this one was in flight.
+			if (token === generation) shown = next;
+		});
+	});
+
+	/* Still busy while the frames decode, not just while ffmpeg runs — what is
+	   on screen is the old timestamp for both stretches. */
+	const pending = $derived(seeking || shown !== pair);
+
 	/* Each label hides once its side is nearly gone, so it never sits stranded
 	   over the wrong image. */
 	const showBefore = $derived(split > 12);
@@ -170,9 +207,9 @@
 		aria-valuenow={Math.round(split)}
 		aria-valuetext={`${Math.round(split)}% original`}
 	>
-		<img class="layer" src={pair.after} alt="Compressed frame" draggable="false" />
+		<img class="layer" src={shown.after} alt="Compressed frame" draggable="false" />
 		<div class="layer clip" style:clip-path={`inset(0 ${100 - split}% 0 0)`}>
-			<img class="layer" src={pair.before} alt="Original frame" draggable="false" />
+			<img class="layer" src={shown.before} alt="Original frame" draggable="false" />
 		</div>
 
 		<!-- Labels sit on the image rather than in the header. Against a busy
@@ -193,7 +230,7 @@
 
 	{#if scrubbable}
 		<div class="timeline">
-			<span class="time" class:pending={seeking}>{formatDuration(at)}</span>
+			<span class="time" class:pending>{formatDuration(at)}</span>
 			<div
 				class="track"
 				bind:this={track}
