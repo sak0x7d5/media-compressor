@@ -13,7 +13,7 @@ pub mod system;
 pub mod tools;
 
 pub use acquire::{AcquireError, AcquireProgress};
-pub use encode::{CancelToken, EncodeError, EncodeJob, EncodeProgress, Speed};
+pub use encode::{CancelToken, EncodeError, EncodeJob, EncodeProgress, PassLog, Speed};
 pub use probe::{probe, ProbeError};
 pub use tools::{FfmpegTools, ToolsError, ToolsSource};
 

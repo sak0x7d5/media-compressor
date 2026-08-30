@@ -194,6 +194,7 @@ fn run(
             &request.input,
             &optimistic,
             &info,
+            context.budget.total_bytes,
             request.speed,
             &request.work_dir,
             cancel,
@@ -214,6 +215,11 @@ fn run(
     on_stage(Stage::Planned { plan: plan.clone(), predicted_bytes: predicted });
 
     let mut output_bytes;
+    // What the statistics files in the work directory describe, once some
+    // attempt has written them. A correction that keeps the same picture spends
+    // them instead of recomputing them, which halves its cost.
+    let mut stats = None;
+
     loop {
         let job = EncodeJob {
             input: request.input.clone(),
@@ -222,11 +228,17 @@ fn run(
             source: info.clone(),
             speed: request.speed,
             passlog_prefix: request.work_dir.join("pass"),
+            reusable_stats: stats,
         };
 
         output_bytes = encode::run(tools, &job, cancel, |progress| {
             on_stage(Stage::Encoding(progress));
         })?;
+
+        // Only a two-pass attempt leaves an analysis behind; a CRF one never
+        // writes the log at all, so there is nothing for the next attempt to
+        // inherit.
+        stats = plan.is_two_pass().then(|| job.pass_log());
 
         match context.correct(&plan, output_bytes) {
             Some(corrected) => {

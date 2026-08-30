@@ -77,6 +77,29 @@ impl Pass {
     }
 }
 
+/// What a two-pass statistics file describes.
+///
+/// The log holds per-frame complexity for one particular picture analysed by
+/// one particular encoder at one particular preset. Change any of those and it
+/// stops describing the frames being encoded.
+///
+/// Bitrate is deliberately absent: spending a different number of bits on the
+/// same analysis is precisely what the log exists for, and it is the only thing
+/// a correction usually changes.
+///
+/// Compared exactly, the floating-point framerate included. Both sides come out
+/// of the same ladder by the same route, so the only inexactness available is a
+/// false *mismatch* — which costs a first pass that could have been skipped,
+/// never a log that should not have been trusted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PassLog {
+    codec: VideoCodec,
+    width: u32,
+    height: u32,
+    fps: f64,
+    speed: Speed,
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodeJob {
     pub input: PathBuf,
@@ -85,18 +108,39 @@ pub struct EncodeJob {
     pub source: MediaInfo,
     pub speed: Speed,
     /// Prefix for the two-pass statistics files. FFmpeg appends `-0.log` and
-    /// `-0.log.mbtree`, both of which we clean up afterwards.
+    /// `-0.log.mbtree`.
     pub passlog_prefix: PathBuf,
+    /// What the statistics files at `passlog_prefix` already describe, if an
+    /// earlier attempt on this file left any behind.
+    pub reusable_stats: Option<PassLog>,
 }
 
 impl EncodeJob {
-    /// The passes this job needs, in order.
-    pub fn passes(&self) -> Vec<Pass> {
-        if self.plan.is_two_pass() {
-            vec![Pass::First, Pass::Second]
-        } else {
-            vec![Pass::Single]
+    /// What this job's own first pass would write to the statistics file.
+    pub fn pass_log(&self) -> PassLog {
+        PassLog {
+            codec: self.plan.codec,
+            width: self.plan.scale.width,
+            height: self.plan.scale.height,
+            fps: self.plan.scale.fps,
+            speed: self.speed,
         }
+    }
+
+    /// The passes this job needs, in order.
+    ///
+    /// A correction that only moves the bitrate reuses the statistics the
+    /// previous attempt wrote. Its first pass would analyse the same frames at
+    /// the same settings and reach the same numbers, so running it again
+    /// doubles the cost of the correction to learn nothing.
+    pub fn passes(&self) -> Vec<Pass> {
+        if !self.plan.is_two_pass() {
+            return vec![Pass::Single];
+        }
+        if self.reusable_stats == Some(self.pass_log()) {
+            return vec![Pass::Second];
+        }
+        vec![Pass::First, Pass::Second]
     }
 
     fn needs_scaling(&self) -> bool {
@@ -216,24 +260,6 @@ impl EncodeJob {
         }
 
         args
-    }
-
-    /// Remove the statistics files a two-pass encode leaves behind.
-    pub fn clean_passlogs(&self) {
-        let Some(prefix) = self.passlog_prefix.file_name().map(|name| name.to_os_string()) else {
-            return;
-        };
-        let Some(dir) = self.passlog_prefix.parent() else { return };
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-
-        let prefix = prefix.to_string_lossy().to_string();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // FFmpeg writes `<prefix>-0.log` and `<prefix>-0.log.mbtree`.
-            if name.starts_with(&prefix) && name.contains(".log") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
     }
 }
 
@@ -401,9 +427,11 @@ pub fn run(
         Ok(())
     })();
 
-    // Statistics files are cleaned up whether or not the encode succeeded —
-    // a stale log left behind would be silently reused by the next attempt.
-    job.clean_passlogs();
+    // The statistics files are deliberately left behind. A correction that
+    // keeps the same picture reuses them, one that does not overwrites them in
+    // its own first pass before the second pass ever reads them, and the
+    // pipeline clears the whole working directory once the file is done. So
+    // there is no window in which a stale log can be believed.
     result?;
 
     output_size(&job.output)
@@ -444,6 +472,7 @@ mod tests {
             source,
             speed: Speed::Balanced,
             passlog_prefix: PathBuf::from("prefix"),
+            reusable_stats: None,
         }
     }
 
@@ -501,6 +530,86 @@ mod tests {
         assert_eq!(value_after(&second, "-pass").as_deref(), Some("2"));
         assert_eq!(value_after(&first, "-passlogfile"), value_after(&second, "-passlogfile"));
         assert_eq!(value_after(&second, "-b:v").as_deref(), Some("730000"));
+    }
+
+    #[test]
+    fn a_correction_that_keeps_the_picture_skips_the_first_pass() {
+        let first = make_job(
+            two_pass_plan(scale(854, 480, 30.0), 96_000, 730_000),
+            source(1920, 1080, 60.0, Some(2)),
+        );
+
+        // The correction the planner actually produces: same ladder rung, a
+        // different number of bits to spend on it.
+        let mut corrected = make_job(
+            two_pass_plan(scale(854, 480, 30.0), 96_000, 610_000),
+            source(1920, 1080, 60.0, Some(2)),
+        );
+        corrected.reusable_stats = Some(first.pass_log());
+
+        assert_eq!(
+            corrected.passes(),
+            vec![Pass::Second],
+            "analysis of an unchanged picture must not be repeated"
+        );
+
+        // And it must still be a real second pass, spending the new bitrate
+        // against the log the first attempt left.
+        let args = rendered(&corrected, Pass::Second);
+        assert_eq!(value_after(&args, "-pass").as_deref(), Some("2"));
+        assert_eq!(value_after(&args, "-b:v").as_deref(), Some("610000"));
+        assert_eq!(value_after(&args, "-passlogfile").as_deref(), Some("prefix"));
+    }
+
+    #[test]
+    fn statistics_are_only_reused_when_they_describe_the_same_encode() {
+        let original = make_job(
+            two_pass_plan(scale(854, 480, 30.0), 96_000, 730_000),
+            source(1920, 1080, 60.0, Some(2)),
+        );
+        let stats = Some(original.pass_log());
+
+        // Every field the log actually depends on. Any of them changing means
+        // the stored frame data no longer describes what we are encoding, and
+        // believing it would corrupt rate control rather than merely slow it.
+        let mut smaller = make_job(
+            two_pass_plan(scale(640, 360, 30.0), 96_000, 730_000),
+            source(1920, 1080, 60.0, Some(2)),
+        );
+        smaller.reusable_stats = stats;
+        assert_eq!(smaller.passes(), vec![Pass::First, Pass::Second], "geometry changed");
+
+        let mut slower_fps = make_job(
+            two_pass_plan(scale(854, 480, 24.0), 96_000, 730_000),
+            source(1920, 1080, 60.0, Some(2)),
+        );
+        slower_fps.reusable_stats = stats;
+        assert_eq!(slower_fps.passes(), vec![Pass::First, Pass::Second], "framerate changed");
+
+        let mut other_codec = make_job(
+            two_pass_plan(scale(854, 480, 30.0), 96_000, 730_000),
+            source(1920, 1080, 60.0, Some(2)),
+        );
+        other_codec.plan.codec = VideoCodec::Hevc;
+        other_codec.reusable_stats = stats;
+        assert_eq!(other_codec.passes(), vec![Pass::First, Pass::Second], "codec changed");
+
+        let mut other_preset = make_job(
+            two_pass_plan(scale(854, 480, 30.0), 96_000, 730_000),
+            source(1920, 1080, 60.0, Some(2)),
+        );
+        other_preset.speed = Speed::Slow;
+        other_preset.reusable_stats = stats;
+        assert_eq!(other_preset.passes(), vec![Pass::First, Pass::Second], "preset changed");
+    }
+
+    #[test]
+    fn a_crf_attempt_leaves_nothing_worth_reusing() {
+        // Nothing writes a log on the CRF path, so a correction after one has
+        // to analyse from scratch however the flag is set.
+        let mut job = make_job(crf_plan(scale(1920, 1080, 60.0), 96_000), source(1920, 1080, 60.0, Some(2)));
+        job.reusable_stats = Some(job.pass_log());
+        assert_eq!(job.passes(), vec![Pass::Single]);
     }
 
     #[test]
