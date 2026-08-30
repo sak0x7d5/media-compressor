@@ -16,6 +16,34 @@ use thiserror::Error;
 /// without the payload becoming the slow part.
 const PREVIEW_WIDTH: u32 = 720;
 
+/// How far before the asked-for moment to actually seek.
+///
+/// A request that lands exactly on a frame boundary is ambiguous: "the frame at
+/// or after T" can fall either side of it, and two files resolving that
+/// differently is how a comparison ends up showing two different moments. It
+/// comes up constantly rather than rarely, because the timeline rounds to
+/// tenths of a second and a tenth is a whole number of frames at every common
+/// rate.
+///
+/// Captured sources make it worse. A recording is rarely exactly constant rate:
+/// its frame timestamps wander by tens of microseconds against the fixed grid
+/// of the re-encode, so the two files agree near the start and then disagree
+/// once that wander has crossed a boundary — which is why this looked like the
+/// comparison drifting out of sync partway through a clip.
+///
+/// Two milliseconds lands clearly inside the intended frame while staying well
+/// under half a frame at any rate worth previewing — 4ms at 120fps — so it can
+/// never reach back into the frame before.
+const SEEK_BIAS_SECONDS: f64 = 0.002;
+
+/// Where to seek for a frame meant to represent `at_seconds`.
+fn seek_target(at_seconds: f64) -> f64 {
+    if !at_seconds.is_finite() {
+        return 0.0;
+    }
+    (at_seconds - SEEK_BIAS_SECONDS).max(0.0)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PreviewPair {
     /// `data:` URLs, ready to drop into an `<img src>`.
@@ -84,9 +112,12 @@ pub fn compare(
     // 4K source costs ~1.2s mid-GOP against ~0.4s at a keyframe, while the
     // result — small, and freshly encoded with a short GOP — costs ~0.2s. In
     // series that smaller cost is paid on top of the larger one for nothing.
+    // Both files are asked for the same instant, biased identically, so that
+    // whatever each one rounds to it rounds to the same frame.
+    let seek_at = seek_target(at_seconds);
     let (original, result) = std::thread::scope(|scope| {
-        let original = scope.spawn(|| grab_frame(tools, before, at_seconds));
-        let result = grab_frame(tools, after, at_seconds);
+        let original = scope.spawn(|| grab_frame(tools, before, seek_at));
+        let result = grab_frame(tools, after, seek_at);
         (original.join(), result)
     });
 
@@ -113,6 +144,25 @@ mod tests {
         let url = as_data_url(&[0xff, 0xd8, 0xff]);
         assert!(url.starts_with("data:image/jpeg;base64,"));
         assert!(url.len() > "data:image/jpeg;base64,".len());
+    }
+
+    #[test]
+    fn a_seek_lands_just_inside_the_frame_it_asks_for() {
+        // Not on the boundary, which is the whole point, but nowhere near the
+        // frame before it either.
+        assert!((seek_target(33.0) - 32.998).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_bias_never_seeks_past_the_start_of_the_file() {
+        assert_eq!(seek_target(0.0), 0.0);
+        assert_eq!(seek_target(0.001), 0.0);
+    }
+
+    #[test]
+    fn a_timestamp_that_is_not_a_number_falls_back_to_the_start() {
+        assert_eq!(seek_target(f64::NAN), 0.0);
+        assert_eq!(seek_target(f64::INFINITY), 0.0);
     }
 
     #[test]
