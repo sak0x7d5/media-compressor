@@ -16,7 +16,9 @@
 		duration?: number;
 		/* A frame for a newer timestamp is still being extracted. */
 		seeking?: boolean;
-		onSeek: (seconds: number) => void;
+		/* `immediate` means the gesture is over: fetch now rather than
+		   waiting to see whether more movement is coming. */
+		onSeek: (seconds: number, immediate?: boolean) => void;
 		onClose: () => void;
 	} = $props();
 
@@ -87,7 +89,12 @@
 	const elapsed = $derived(scrubbable ? (at / lastFrame) * 100 : 0);
 
 	function seekTo(seconds: number) {
-		const next = Math.max(0, Math.min(lastFrame, seconds));
+		/* Rounded to tenths so that dragging back over ground already covered
+		   asks for timestamps that have been fetched before, instead of
+		   near-misses that no cache can answer. Two frames 100ms apart are the
+		   same shot anyway. */
+		const clamped = Math.max(0, Math.min(lastFrame, seconds));
+		const next = Math.round(clamped * 10) / 10;
 		if (next === at) return;
 		at = next;
 		onSeek(next);
@@ -131,7 +138,11 @@
 	}}
 	onpointerup={() => {
 		dragging = false;
-		scrubbing = false;
+		if (scrubbing) {
+			scrubbing = false;
+			/* The drag is finished, so there is nothing left to coalesce. */
+			onSeek(at, true);
+		}
 	}}
 />
 

@@ -86,6 +86,12 @@
 	let previewSeeking = $state(false);
 	let seekToken = 0;
 	let seekTimer: ReturnType<typeof setTimeout> | undefined;
+	/* Frames already pulled for the open comparison. Going back and forth
+	   between two moments is how this gets used, and the second visit
+	   should not pay ffmpeg again. Bounded because each entry is two
+	   base64 frames. */
+	const SEEK_CACHE_LIMIT = 16;
+	let seekCache = new Map<string, PreviewPair>();
 
 	let options = $state<Omit<EncodeSettings, 'target_bytes'>>({
 		safety_margin: 0.95,
@@ -225,6 +231,7 @@
 
 	async function compare(job: Job) {
 		previewBusy = true;
+		seekCache = new Map();
 		try {
 			preview = await previewPair(job.input, job.output);
 			previewSource = {
@@ -246,10 +253,22 @@
 	 * drag to settle rather than firing per pixel — a swap mid-drag is a frame
 	 * nobody looks at anyway.
 	 */
-	function seekPreview(seconds: number) {
+	function seekPreview(seconds: number, immediate = false) {
 		clearTimeout(seekTimer);
+
+		/* A frame already in hand is not worth a round trip, or the debounce
+		   that exists to protect one. */
+		const cached = seekCache.get(seconds.toFixed(1));
+		if (cached) {
+			seekToken++;
+			preview = cached;
+			previewSeeking = false;
+			return;
+		}
+
 		if (previewSource) previewSeeking = true;
-		seekTimer = setTimeout(() => void runSeek(seconds), 150);
+		if (immediate) void runSeek(seconds);
+		else seekTimer = setTimeout(() => void runSeek(seconds), 150);
 	}
 
 	/* Replies can land out of order, so a stale one is dropped rather than
@@ -265,6 +284,11 @@
 		previewSeeking = true;
 		try {
 			const pair = await previewPair(source.input, source.output, seconds);
+			seekCache.set(seconds.toFixed(1), pair);
+			// Oldest first, so deleting from the front drops the least recent.
+			if (seekCache.size > SEEK_CACHE_LIMIT) {
+				seekCache.delete(seekCache.keys().next().value as string);
+			}
 			if (token === seekToken) preview = pair;
 		} catch (error) {
 			if (token === seekToken) flash(String(error));
@@ -275,6 +299,7 @@
 
 	function closePreview() {
 		clearTimeout(seekTimer);
+		seekCache = new Map();
 		seekToken++;
 		preview = null;
 		previewSource = null;

@@ -79,10 +79,23 @@ pub fn compare(
     // A still image has no timeline to seek along.
     let at_seconds = if at_seconds.is_finite() && at_seconds > 0.0 { at_seconds } else { 0.0 };
 
-    let before_frame = grab_frame(tools, before, at_seconds)
-        .map_err(|_| PreviewError::NoFrame { which: "the original" })?;
-    let after_frame = grab_frame(tools, after, at_seconds)
-        .map_err(|_| PreviewError::NoFrame { which: "the result" })?;
+    // Both files are read at once. `-ss` lands on the keyframe before the
+    // timestamp and decodes forward from there, so the original dominates: a
+    // 4K source costs ~1.2s mid-GOP against ~0.4s at a keyframe, while the
+    // result — small, and freshly encoded with a short GOP — costs ~0.2s. In
+    // series that smaller cost is paid on top of the larger one for nothing.
+    let (original, result) = std::thread::scope(|scope| {
+        let original = scope.spawn(|| grab_frame(tools, before, at_seconds));
+        let result = grab_frame(tools, after, at_seconds);
+        (original.join(), result)
+    });
+
+    let before_frame = match original {
+        Ok(Ok(bytes)) => bytes,
+        // A panic in the worker reads the same as a frame that would not come.
+        _ => return Err(PreviewError::NoFrame { which: "the original" }),
+    };
+    let after_frame = result.map_err(|_| PreviewError::NoFrame { which: "the result" })?;
 
     Ok(PreviewPair {
         before: as_data_url(&before_frame),
