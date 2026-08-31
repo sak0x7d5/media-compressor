@@ -106,11 +106,20 @@ export interface ImageOutcome {
 /** Serde tags these on `kind`, flattening the variant's fields alongside it. */
 export type MediaOutcome = VideoOutcome | ImageOutcome;
 
+/** What became of the source file, once the job finished. */
+export type Original = 'kept' | 'replaced' | 'kept-not-smaller';
+
 export type JobEvent =
 	| { event: 'queued'; id: string; input: string; output: string }
 	| { event: 'started'; id: string }
 	| { event: 'progress'; id: string; stage: Stage }
-	| { event: 'finished'; id: string; outcome: MediaOutcome; output: string }
+	| {
+			event: 'finished';
+			id: string;
+			outcome: MediaOutcome;
+			output: string;
+			original: Original;
+	  }
 	| { event: 'failed'; id: string; message: string }
 	| { event: 'cancelled'; id: string };
 
@@ -132,10 +141,18 @@ export interface EncodeSettings {
 	max_dimension?: number;
 	/** Where results are written. Null or absent means beside the original. */
 	output_dir?: string | null;
+	/** Whether the result joins the original or takes its place. */
+	disposition?: Disposition;
 }
 
-/** Where compressed files land. */
-export type OutputMode = 'beside' | 'folder' | 'ask';
+/** What happens to the original once the result is written. */
+export type Disposition = 'keep' | 'replace';
+
+/**
+ * Where compressed files land. "replace" is the one destructive answer: the
+ * result takes the original's name and the original is deleted.
+ */
+export type OutputMode = 'beside' | 'folder' | 'ask' | 'replace';
 
 export interface QueuedFile {
 	id: string;
@@ -143,6 +160,7 @@ export interface QueuedFile {
 	output: string;
 	name: string;
 	input_bytes: number;
+	replaces_input: boolean;
 }
 
 export interface UpdateInfo {

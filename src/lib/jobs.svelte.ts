@@ -1,6 +1,14 @@
 /** Job list state, and the translation from backend events into what a row shows. */
 
-import type { EncodePlan, JobEvent, MediaInfo, MediaOutcome, QueuedFile, Stage } from './ipc';
+import type {
+	EncodePlan,
+	JobEvent,
+	MediaInfo,
+	MediaOutcome,
+	Original,
+	QueuedFile,
+	Stage
+} from './ipc';
 import { formatBitrate, formatBytes, formatFps } from './format';
 
 export type JobState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -20,6 +28,14 @@ export interface Job {
 	detail: string;
 	outcome?: MediaOutcome;
 	error?: string;
+	/** True while this job is still expected to delete its source. */
+	replacesInput: boolean;
+	/**
+	 * What became of the source, known only once the job has finished. A
+	 * replaced source is gone, which rules out anything that wants to read it —
+	 * the before/after comparison above all.
+	 */
+	original?: Original;
 }
 
 const CODEC_LABEL: Record<EncodePlan['codec'], string> = {
@@ -176,7 +192,8 @@ export class JobList {
 				state: 'queued',
 				status: 'queued',
 				fraction: 0,
-				detail: formatBytes(file.input_bytes)
+				detail: formatBytes(file.input_bytes),
+				replacesInput: file.replaces_input
 			});
 
 			// Anything that happened while we were waiting for this row.
@@ -229,6 +246,10 @@ export class JobList {
 				job.fraction = 1;
 				job.outcome = event.outcome;
 				job.output = event.output;
+				job.original = event.original;
+				// A replacement that was declined leaves the source in place, so
+				// the row stops advertising one.
+				job.replacesInput = event.original === 'replaced';
 				job.detail = describeResult(job.inputBytes, event.outcome);
 				break;
 			}

@@ -49,7 +49,14 @@
 	}}
 >
 	<div class="labels">
-		<div class="name">{job.name}</div>
+		<div class="name">
+			{job.name}
+			<!-- Queued under a mode the settings may since have changed, so the
+			     footer's warning cannot speak for this row. -->
+			{#if job.replacesInput}
+				<span class="replaces" title="The original will be replaced by the result">replaces</span>
+			{/if}
+		</div>
 		<div class="detail">{job.detail}</div>
 	</div>
 
@@ -176,6 +183,19 @@
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
+	}
+
+	/* A quiet tag rather than a warning: the mode was chosen deliberately, and
+	   a row per file shouting about it would be noise. */
+	.replaces {
+		margin-left: 6px;
+		padding: 1px 5px;
+		border-radius: 4px;
+		background: var(--bg-row-hover);
+		color: var(--text-muted);
+		font-family: var(--font-mono);
+		font-size: 10px;
+		vertical-align: 1px;
 	}
 
 	.detail {

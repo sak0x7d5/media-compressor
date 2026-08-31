@@ -14,10 +14,41 @@ use crate::images::ImageFormat;
 use crate::pipeline::{compress_media, CompressRequest, MediaOutcome, Stage};
 use crate::strategy::plan::Options;
 use crate::strategy::Target;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
+
+/// What becomes of the original once the compressed file is written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Disposition {
+    /// The result is a new file and the original stays where it is.
+    #[default]
+    Keep,
+    /// The result takes the original's place and the original is deleted.
+    ///
+    /// The encode still writes to a scratch file first: nothing is destroyed
+    /// until there is a finished file ready to stand in its place.
+    Replace,
+}
+
+/// What actually became of the original, once the job finished.
+///
+/// Asking to replace is not the same as having replaced, and the difference
+/// decides what the UI may offer — there is nothing left to compare a result
+/// against once its source is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Original {
+    /// Untouched. The result is a separate file.
+    Kept,
+    /// Deleted, with the result now carrying its name.
+    Replaced,
+    /// Replacement was asked for, but the result came out no smaller than the
+    /// source, so the result was discarded and the original left alone.
+    KeptNotSmaller,
+}
 
 #[derive(Debug, Clone)]
 pub struct QueueItem {
@@ -30,6 +61,10 @@ pub struct QueueItem {
     pub work_dir: PathBuf,
     pub image_format: ImageFormat,
     pub max_dimension: Option<u32>,
+    /// Set when this job must displace its source: the path the finished file
+    /// ends up at, which is the original's name carrying whatever extension
+    /// the new format needs. `output` is then a scratch file beside it.
+    pub replacement: Option<PathBuf>,
 }
 
 /// Everything the UI is told about a job.
@@ -39,7 +74,7 @@ pub enum JobEvent {
     Queued { id: String, input: String, output: String },
     Started { id: String },
     Progress { id: String, stage: Stage },
-    Finished { id: String, outcome: MediaOutcome, output: String },
+    Finished { id: String, outcome: MediaOutcome, output: String, original: Original },
     Failed { id: String, message: String },
     Cancelled { id: String },
 }
@@ -234,21 +269,118 @@ fn worker(
         });
 
         match result {
-            Ok(outcome) => listener(JobEvent::Finished {
-                id: item.id.clone(),
-                output: item.output.to_string_lossy().to_string(),
-                outcome,
-            }),
-            Err(error) if error.is_cancellation() => {
-                listener(JobEvent::Cancelled { id: item.id.clone() })
-            }
+            Ok(outcome) => listener(settle(&item, outcome)),
             Err(error) => {
-                listener(JobEvent::Failed { id: item.id.clone(), message: error.to_string() })
+                // A replacement encodes into the user's own folder, so a job
+                // that ended early leaves a half-written scratch file sitting
+                // next to the original. It goes however the job ended.
+                if item.replacement.is_some() {
+                    let _ = std::fs::remove_file(&item.output);
+                }
+
+                if error.is_cancellation() {
+                    listener(JobEvent::Cancelled { id: item.id.clone() });
+                } else {
+                    listener(JobEvent::Failed { id: item.id.clone(), message: error.to_string() });
+                }
             }
         }
 
         shared.tokens.lock().unwrap().remove(&item.id);
     }
+}
+
+/// Turn a finished encode into the event the UI sees.
+///
+/// This is the only place a source file is ever destroyed, and it happens
+/// after the encode rather than before it — by the time anything is removed
+/// there is a complete file ready to take its place.
+fn settle(item: &QueueItem, outcome: MediaOutcome) -> JobEvent {
+    let Some(destination) = item.replacement.as_deref() else {
+        return JobEvent::Finished {
+            id: item.id.clone(),
+            output: item.output.to_string_lossy().to_string(),
+            outcome,
+            original: Original::Kept,
+        };
+    };
+
+    // Compressing something already small can produce a bigger file. Trading
+    // the source for that loses on both counts — larger *and* re-encoded — so
+    // the source stays and the result goes. A source we cannot measure is not
+    // grounds for refusing; only a measured one that wins.
+    let source_bytes = std::fs::metadata(&item.input).map(|meta| meta.len()).unwrap_or(0);
+    if source_bytes > 0 && outcome.output_bytes() >= source_bytes {
+        let _ = std::fs::remove_file(&item.output);
+        return JobEvent::Finished {
+            id: item.id.clone(),
+            output: item.input.to_string_lossy().to_string(),
+            outcome,
+            original: Original::KeptNotSmaller,
+        };
+    }
+
+    let destination = settled_destination(&item.input, destination);
+    match install_replacement(&item.input, &item.output, &destination) {
+        Ok(()) => JobEvent::Finished {
+            id: item.id.clone(),
+            output: destination.to_string_lossy().to_string(),
+            outcome,
+            original: Original::Replaced,
+        },
+        // The encode is lost, but the source is not. Reporting why beats
+        // leaving a scratch file behind and calling the job done.
+        Err(error) => {
+            let _ = std::fs::remove_file(&item.output);
+            JobEvent::Failed {
+                id: item.id.clone(),
+                message: format!("could not replace the original: {error}"),
+            }
+        }
+    }
+}
+
+/// The destination, re-checked against the disk as it is now.
+///
+/// It was chosen when the job was queued, which for a batch can be many
+/// minutes and several finished files ago. Two sources in one batch that
+/// differ only by container — `clip.mov` and `clip.webm` — resolve to the same
+/// `clip.mp4`, so without this the second one lands on the first one's result
+/// and destroys it.
+///
+/// The source's own name is never re-resolved away: that is the file this job
+/// exists to replace.
+fn settled_destination(input: &Path, chosen: &Path) -> PathBuf {
+    if same_file(chosen, input) || !chosen.exists() {
+        return chosen.to_path_buf();
+    }
+
+    let extension = chosen.extension().unwrap_or_default().to_string_lossy().to_string();
+    replacement_path_for(input, &extension)
+}
+
+/// Put a finished file in its source's place.
+///
+/// The rename comes first and the delete second, so no moment exists in which
+/// neither file is there. Where the extension is unchanged the two are one
+/// path and the rename alone does it — `fs::rename` replaces an existing
+/// destination on both platforms, which is the atomic swap wanted here.
+fn install_replacement(original: &Path, staged: &Path, destination: &Path) -> std::io::Result<()> {
+    // Decided before the move, while both paths still describe real files: a
+    // rename that consumes the original leaves nothing left to compare.
+    let destination_is_original = same_file(original, destination);
+
+    std::fs::rename(staged, destination)?;
+
+    // A format change lands the result under a new name — `clip.mov` becomes
+    // `clip.mp4` — leaving the source behind to clear. The result is already
+    // in place by now, so a source that refuses to go (open in a player, say)
+    // is litter rather than a failed job.
+    if !destination_is_original {
+        let _ = std::fs::remove_file(original);
+    }
+
+    Ok(())
 }
 
 /// Two directories that are the same place, as best we can tell.
@@ -313,6 +445,49 @@ fn same_file(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
+}
+
+/// Where a replacement ends up: the original's own name, carrying whatever
+/// extension the new format needs.
+///
+/// The source is the one file a replacement may displace. An unrelated file
+/// that happens to hold the name — a `clip.mp4` sitting beside the `clip.mov`
+/// being compressed — gets a suffix instead, exactly as it would in "keep"
+/// mode. Replacing what was asked for must never take something else with it.
+pub fn replacement_path_for(input: &Path, extension: &str) -> PathBuf {
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    let stem = input.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+
+    let mut candidate = parent.join(format!("{stem}.{extension}"));
+    let mut counter = 2;
+
+    while candidate.exists() && !same_file(&candidate, input) {
+        candidate = parent.join(format!("{stem} ({counter}).{extension}"));
+        counter += 1;
+        if counter > 999 {
+            break;
+        }
+    }
+
+    candidate
+}
+
+/// The scratch file a replacement is encoded into.
+///
+/// It sits beside the original rather than in the app's work directory so the
+/// final step is a rename within one folder: instant, and atomic where the
+/// filesystem allows. Staging on another volume would turn every replacement
+/// into a second full copy of a file that can be gigabytes.
+///
+/// The extension has to be the real one because FFmpeg picks its muxer from
+/// it. The rest of the name is there to be unmistakably temporary, so a job
+/// cut short by a crash leaves something recognisable behind rather than a
+/// plausible-looking video.
+pub fn staging_path_for(input: &Path, extension: &str, id: &str) -> PathBuf {
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    let stem = input.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+
+    parent.join(format!(".{stem}.{id}.part.{extension}"))
 }
 
 #[cfg(test)]
@@ -416,6 +591,254 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A scratch directory that cleans up after itself, so a failing assertion
+    /// cannot leave a half-swapped file behind to confuse the next run.
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("media-compressor-tests")
+            .join(format!("{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn replacing_item(input: &Path, staged: &Path, destination: &Path) -> QueueItem {
+        QueueItem {
+            id: "job-1".to_string(),
+            input: input.to_path_buf(),
+            output: staged.to_path_buf(),
+            target: Target::new(20_000_000),
+            options: Options::default(),
+            speed: Speed::Fast,
+            work_dir: std::env::temp_dir().join("mc-queue-test"),
+            image_format: ImageFormat::Webp,
+            max_dimension: None,
+            replacement: Some(destination.to_path_buf()),
+        }
+    }
+
+    fn image_result(output_bytes: u64) -> MediaOutcome {
+        MediaOutcome::Image(crate::images::ImageOutcome {
+            output_bytes,
+            quality: 74,
+            width: 1920,
+            height: 1080,
+            downscale_steps: 0,
+            encodes: 3,
+            within_limit: true,
+        })
+    }
+
+    #[test]
+    fn a_replacement_keeping_its_format_lands_on_the_original_itself() {
+        let dir = scratch("replace-same-ext");
+        let input = dir.join("clip.mp4");
+        std::fs::write(&input, b"source").unwrap();
+
+        // Same extension in and out: there is exactly one name involved, and
+        // the result has to end up wearing it.
+        assert_eq!(replacement_path_for(&input, "mp4"), input);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_replacement_changing_format_takes_the_new_extension() {
+        let dir = scratch("replace-new-ext");
+        let input = dir.join("clip.mov");
+        std::fs::write(&input, b"source").unwrap();
+
+        assert_eq!(replacement_path_for(&input, "mp4"), dir.join("clip.mp4"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The case that turns a replacement into a data-loss bug: compressing
+    /// `clip.mov` next to an unrelated `clip.mp4` must not consume the mp4.
+    #[test]
+    fn a_replacement_never_displaces_a_file_that_is_not_its_source() {
+        let dir = scratch("replace-bystander");
+        let input = dir.join("clip.mov");
+        let bystander = dir.join("clip.mp4");
+        std::fs::write(&input, b"source").unwrap();
+        std::fs::write(&bystander, b"someone else's file").unwrap();
+
+        let destination = replacement_path_for(&input, "mp4");
+
+        assert_ne!(destination, bystander, "must not target the bystander");
+        assert_eq!(
+            std::fs::read(&bystander).unwrap(),
+            b"someone else's file",
+            "the bystander must survive untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_staging_file_collides_with_neither_the_source_nor_the_destination() {
+        let input = PathBuf::from("D:/clips/raid.mov");
+        let staged = staging_path_for(&input, "mp4", "job-7");
+
+        assert_eq!(staged.parent(), input.parent(), "must stage on the source's volume");
+        assert_ne!(staged, input);
+        assert_ne!(staged, replacement_path_for(&input, "mp4"));
+        // FFmpeg picks its muxer from the extension, so the scratch file needs
+        // the real one.
+        assert_eq!(staged.extension().unwrap(), "mp4");
+    }
+
+    #[test]
+    fn installing_a_same_format_replacement_swaps_the_contents_over() {
+        let dir = scratch("install-same");
+        let input = dir.join("clip.mp4");
+        std::fs::write(&input, b"the original").unwrap();
+
+        let staged = staging_path_for(&input, "mp4", "job-1");
+        std::fs::write(&staged, b"the compressed result").unwrap();
+
+        install_replacement(&input, &staged, &input).unwrap();
+
+        assert_eq!(std::fs::read(&input).unwrap(), b"the compressed result");
+        assert!(!staged.exists(), "the scratch file must not linger");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn installing_a_new_format_replacement_clears_the_old_file() {
+        let dir = scratch("install-new-ext");
+        let input = dir.join("clip.mov");
+        std::fs::write(&input, b"the original").unwrap();
+
+        let destination = dir.join("clip.mp4");
+        let staged = staging_path_for(&input, "mp4", "job-1");
+        std::fs::write(&staged, b"the compressed result").unwrap();
+
+        install_replacement(&input, &staged, &destination).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"the compressed result");
+        assert!(!input.exists(), "the source must be gone once its result is in place");
+        assert!(!staged.exists(), "the scratch file must not linger");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_finished_replacement_reports_the_destination_rather_than_the_scratch_file() {
+        let dir = scratch("settle-replaced");
+        let input = dir.join("clip.mp4");
+        std::fs::write(&input, vec![0u8; 4096]).unwrap();
+
+        let staged = staging_path_for(&input, "mp4", "job-1");
+        std::fs::write(&staged, b"smaller").unwrap();
+
+        let event = settle(&replacing_item(&input, &staged, &input), image_result(7));
+
+        match event {
+            JobEvent::Finished { output, original, .. } => {
+                assert_eq!(original, Original::Replaced);
+                assert_eq!(PathBuf::from(output), input, "the row must point at the real file");
+            }
+            other => panic!("expected a finished job, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&input).unwrap(), b"smaller");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two sources in one batch differing only by container both resolve to
+    /// `clip.mp4` when they are queued, and the second one finishes long after
+    /// the first has written that file. Landing on it would destroy a result
+    /// the user had already been shown.
+    #[test]
+    fn a_second_replacement_does_not_land_on_the_first_ones_result() {
+        let dir = scratch("settle-batch-collision");
+
+        let first_result = dir.join("clip.mp4");
+        std::fs::write(&first_result, b"the result of compressing clip.mov").unwrap();
+
+        // Queued when `clip.mp4` did not exist yet, so this is what it chose.
+        let second = dir.join("clip.webm");
+        std::fs::write(&second, vec![0u8; 4096]).unwrap();
+        let staged = staging_path_for(&second, "mp4", "job-2");
+        std::fs::write(&staged, b"smaller").unwrap();
+
+        let event = settle(&replacing_item(&second, &staged, &first_result), image_result(7));
+
+        match event {
+            JobEvent::Finished { output, original, .. } => {
+                assert_eq!(original, Original::Replaced);
+                assert_ne!(
+                    PathBuf::from(&output),
+                    first_result,
+                    "must step around the earlier result"
+                );
+                assert_eq!(std::fs::read(PathBuf::from(output)).unwrap(), b"smaller");
+            }
+            other => panic!("expected a finished job, got {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::read(&first_result).unwrap(),
+            b"the result of compressing clip.mov",
+            "the earlier result must survive"
+        );
+        assert!(!second.exists(), "the source must still be replaced");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compressing something already small can come out bigger. Swapping then
+    /// would cost quality and gain nothing, so the source wins and the result
+    /// is thrown away.
+    #[test]
+    fn a_result_no_smaller_than_its_source_leaves_the_source_alone() {
+        let dir = scratch("settle-not-smaller");
+        let input = dir.join("clip.mp4");
+        std::fs::write(&input, b"the original").unwrap();
+
+        let staged = staging_path_for(&input, "mp4", "job-1");
+        std::fs::write(&staged, b"a bigger re-encode of the original").unwrap();
+
+        let event = settle(&replacing_item(&input, &staged, &input), image_result(34));
+
+        match event {
+            JobEvent::Finished { output, original, .. } => {
+                assert_eq!(original, Original::KeptNotSmaller);
+                assert_eq!(PathBuf::from(output), input);
+            }
+            other => panic!("expected a finished job, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&input).unwrap(), b"the original", "the source must survive");
+        assert!(!staged.exists(), "the discarded result must not linger");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_job_that_keeps_its_original_touches_nothing() {
+        let dir = scratch("settle-keep");
+        let input = dir.join("clip.mp4");
+        let output = dir.join("clip (compressed).mp4");
+        std::fs::write(&input, b"the original").unwrap();
+        std::fs::write(&output, b"the result").unwrap();
+
+        let item = QueueItem { replacement: None, ..replacing_item(&input, &output, &input) };
+
+        match settle(&item, image_result(10)) {
+            JobEvent::Finished { original, output: reported, .. } => {
+                assert_eq!(original, Original::Kept);
+                assert_eq!(PathBuf::from(reported), output);
+            }
+            other => panic!("expected a finished job, got {other:?}"),
+        }
+        assert!(input.exists(), "keeping means keeping");
+        assert!(output.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_queue_with_no_tools_fails_jobs_rather_than_hanging() {
         let tools: Arc<Mutex<Option<FfmpegTools>>> = Arc::new(Mutex::new(None));
@@ -438,6 +861,7 @@ mod tests {
             work_dir: std::env::temp_dir().join("mc-queue-test"),
             image_format: ImageFormat::Webp,
             max_dimension: None,
+            replacement: None,
         });
 
         let event = rx
@@ -461,6 +885,7 @@ mod tests {
             work_dir: std::env::temp_dir().join("mc-queue-test"),
             image_format: ImageFormat::Webp,
             max_dimension: None,
+            replacement: None,
         }
     }
 
@@ -529,6 +954,7 @@ mod tests {
             work_dir: std::env::temp_dir().join("mc-queue-test"),
             image_format: ImageFormat::Webp,
             max_dimension: None,
+            replacement: None,
         };
 
         queue.cancel(&item.id);

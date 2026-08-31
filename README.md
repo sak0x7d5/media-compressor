@@ -149,6 +149,42 @@ mean; nobody has ever been annoyed that a file came out at 19.2 MB.
 
 ---
 
+## Where results go
+
+Four choices, in Settings:
+
+| Mode | Result | Original |
+|---|---|---|
+| Next to the original *(default)* | `clip (compressed).mp4` | untouched |
+| In a folder I choose | `clip.mp4`, in that folder | untouched |
+| Ask me each time | `clip.mp4`, in the folder picked per batch | untouched |
+| Replace the original | `clip.mp4`, where `clip.mp4` was | **deleted** |
+
+A result landing in a folder of its own keeps the source's exact name; sharing a
+folder with the source it has to be distinguished, hence the suffix. Names
+matter here because Discord shows the filename to everyone in the channel.
+
+**Replacing deletes files you already had, and lossy compression is not
+reversible.** It is off by default, asks for confirmation the first time it is
+switched on, and the footer says `replacing originals` for as long as it stays
+on. What it does not do:
+
+- It never encodes over the file it is reading. The encode goes to a scratch
+  file beside the original, and only a *finished* encode is moved into place —
+  a crash, a cancel, or a failed encode leaves the original as it was.
+- It never touches a file that isn't the one being compressed. Compressing
+  `clip.mov` next to an unrelated `clip.mp4` steps around the `clip.mp4` rather
+  than consuming it.
+- It never trades a file for a worse one. A result that comes out no smaller
+  than its source is discarded and the original left alone — that outcome would
+  be larger *and* re-encoded.
+
+A format change replaces across the extension: compressing `clip.mov` leaves
+`clip.mp4` and no `clip.mov`. Comparing before and after is unavailable for a
+replaced file, because there is no longer a "before" to read.
+
+---
+
 ## FFmpeg
 
 FFmpeg does all the actual encoding. It isn't bundled — on first run the app

@@ -8,7 +8,10 @@ use crate::ffmpeg::tools::FfmpegTools;
 use crate::images::{is_image, ImageFormat};
 use crate::presets::{self, PresetFile};
 use crate::preview::{self, PreviewPair};
-use crate::queue::{output_path_for, JobEvent, Queue, QueueItem};
+use crate::queue::{
+    output_path_for, replacement_path_for, staging_path_for, Disposition, JobEvent, Queue,
+    QueueItem,
+};
 use crate::shell_integration;
 use crate::strategy::plan::Options;
 use crate::strategy::{MediaInfo, SharpnessBias, Target, VideoCodec};
@@ -103,6 +106,10 @@ pub struct EncodeSettings {
     /// Where results are written. `None` means beside the original.
     #[serde(default)]
     pub output_dir: Option<String>,
+    /// Whether the result joins the original or takes its place. Defaults to
+    /// joining it — the destructive answer is never the one nobody chose.
+    #[serde(default)]
+    pub disposition: Option<Disposition>,
 }
 
 fn default_margin() -> f64 {
@@ -148,6 +155,10 @@ pub struct QueuedFile {
     pub output: String,
     pub name: String,
     pub input_bytes: u64,
+    /// True when finishing this job will delete `input`. The UI shows the row
+    /// differently for it, so it has to know before the encode rather than
+    /// after.
+    pub replaces_input: bool,
 }
 
 #[tauri::command]
@@ -282,6 +293,10 @@ pub fn add_files(
         .map(PathBuf::from)
         .filter(|dir| dir.is_dir() || std::fs::create_dir_all(dir).is_ok());
 
+    // Replacing happens in the source's own folder by definition, so a chosen
+    // output folder has nothing to say about it.
+    let disposition = settings.disposition.unwrap_or_default();
+
     for path in paths {
         let input = PathBuf::from(&path);
         if !input.is_file() {
@@ -294,7 +309,23 @@ pub fn add_files(
         let image_format = settings.image_format.unwrap_or_default();
         let extension =
             if is_image(&input) { image_format.extension() } else { "mp4" };
-        let output = output_path_for(&input, extension, output_dir.as_deref());
+
+        // Two paths, and in "keep" mode they are the same one: where FFmpeg
+        // writes, and where the file ends up. Replacing separates them — the
+        // encode goes to a scratch file first, and only a finished encode is
+        // moved onto the original.
+        let (output, destination, replacement) = match disposition {
+            Disposition::Keep => {
+                let output = output_path_for(&input, extension, output_dir.as_deref());
+                (output.clone(), output, None)
+            }
+            Disposition::Replace => {
+                let destination = replacement_path_for(&input, extension);
+                let staging = staging_path_for(&input, extension, &id);
+                (staging, destination.clone(), Some(destination))
+            }
+        };
+
         let input_bytes = std::fs::metadata(&input).map(|meta| meta.len()).unwrap_or(0);
         let name = input
             .file_name()
@@ -304,9 +335,12 @@ pub fn add_files(
         let summary = QueuedFile {
             id: id.clone(),
             input: input.to_string_lossy().to_string(),
-            output: output.to_string_lossy().to_string(),
+            // Where the file will end up, not the scratch file it passes
+            // through. A row showing ".clip.job-3.part.mp4" would be nonsense.
+            output: destination.to_string_lossy().to_string(),
             name,
             input_bytes,
+            replaces_input: replacement.is_some(),
         };
 
         let _ = app.emit(
@@ -327,6 +361,7 @@ pub fn add_files(
             speed: settings.speed.unwrap_or_default(),
             image_format,
             max_dimension: settings.max_dimension,
+            replacement,
             // Each job gets its own scratch directory so two-pass logs from one
             // can never be picked up by another.
             work_dir: state.work_root.join(&id),
@@ -425,6 +460,7 @@ mod tests {
             image_format: None,
             max_dimension: None,
             output_dir: None,
+            disposition: None,
         }
     }
 

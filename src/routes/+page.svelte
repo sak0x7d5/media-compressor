@@ -67,6 +67,9 @@
 	/* Where results go. "beside" writes next to the original, which is the
 	   default and needs no folder at all. */
 	let outputMode = $state<OutputMode>('beside');
+	/* Replacing is the one mode that destroys something, so it stays visible in
+	   the footer rather than only in the settings panel it was set from. */
+	const replacing = $derived(outputMode === 'replace');
 	let outputDir = $state<string | null>(null);
 	let preview = $state<PreviewPair | null>(null);
 	let previewBusy = $state(false);
@@ -118,6 +121,9 @@
 	 */
 	async function resolveOutputDir(): Promise<string | null | undefined> {
 		if (outputMode === 'beside') return null;
+		// Replacing happens in the original's own folder by definition, so there
+		// is nothing to choose.
+		if (outputMode === 'replace') return null;
 		if (outputMode === 'folder') return outputDir;
 
 		const chosen = await open({ directory: true, title: 'Save compressed files to' });
@@ -138,7 +144,13 @@
 		preview = null;
 		openJobId = null;
 		try {
-			jobs.add(await addFiles(media, { ...settings, output_dir: dir }));
+			jobs.add(
+				await addFiles(media, {
+					...settings,
+					output_dir: dir,
+					disposition: replacing ? 'replace' : 'keep'
+				})
+			);
 		} catch (error) {
 			flash(String(error));
 		}
@@ -345,6 +357,9 @@
 				{:else}
 					target {formatBytes(limitBytes)} · {options.codec}
 				{/if}
+				{#if replacing}
+					· <span class="replacing">replacing originals</span>
+				{/if}
 			</span>
 
 			{#if jobs.finished.length > 1}
@@ -453,6 +468,12 @@
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
+	}
+
+	/* Loud enough to notice before dropping a file in, quiet enough not to
+	   look like an error. */
+	.replacing {
+		color: var(--danger);
 	}
 
 	button {

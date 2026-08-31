@@ -35,6 +35,11 @@
 				? job.outcome.encodes
 				: 0
 	);
+
+	/* The comparison reads both files. Once a source has been replaced there is
+	   no "before" left to read, so the button goes rather than offering a click
+	   that can only fail. */
+	const comparable = $derived(job.original !== 'replaced');
 </script>
 
 <div class="card">
@@ -72,10 +77,21 @@
 		</p>
 	{/if}
 
+	{#if job.original === 'replaced'}
+		<p class="note">The original was replaced by this file.</p>
+	{:else if job.original === 'kept-not-smaller'}
+		<p class="warning">
+			The compressed version came out no smaller than the original, so it was discarded and
+			your file was left as it was.
+		</p>
+	{/if}
+
 	<div class="actions">
 		<button class="primary" onclick={() => onCopy(job.output)}>Copy to clipboard</button>
 		<button onclick={() => onReveal(job.output)}>Show in folder</button>
-		<button onclick={onCompare} disabled={busy}>{busy ? 'Loading…' : 'Compare'}</button>
+		{#if comparable}
+			<button onclick={onCompare} disabled={busy}>{busy ? 'Loading…' : 'Compare'}</button>
+		{/if}
 		<button class="trailing" onclick={onBack ?? onClear}>{onBack ? 'Back to queue' : 'Done'}</button>
 	</div>
 </div>
@@ -192,6 +208,15 @@
 		font-size: 12px;
 		line-height: 1.5;
 		color: var(--danger);
+	}
+
+	/* Stating what happened, not warning about it — a replacement that went as
+	   asked is the normal outcome of that mode. */
+	.note {
+		margin: 0 0 16px;
+		font-size: 12px;
+		line-height: 1.5;
+		color: var(--text-muted);
 	}
 
 	.actions {

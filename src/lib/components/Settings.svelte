@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { EncodeSettings, FfmpegStatus, OutputMode, PresetFile } from '$lib/ipc';
-	import { open } from '@tauri-apps/plugin-dialog';
+	import { confirm, open } from '@tauri-apps/plugin-dialog';
 	import { checkForUpdate, installUpdate, setPresetsUrl, setShellMenu } from '$lib/ipc';
 
 	let {
@@ -42,6 +42,34 @@
 		const chosen = await open({ directory: true, title: 'Save compressed files to' });
 		if (!chosen) return;
 		onOutput('folder', Array.isArray(chosen) ? chosen[0] : chosen);
+	}
+
+	/**
+	 * Turning on replacement asks once, and only when switching to it.
+	 *
+	 * The setting sticks, so this is the last point at which anyone is thinking
+	 * about it — every drop after this silently consumes its original. Nothing
+	 * else in the app deletes a file the user already had.
+	 */
+	async function chooseMode(mode: OutputMode) {
+		if (mode === 'replace' && outputMode !== 'replace') {
+			const agreed = await confirm(
+				'Compressed files will take the place of the originals, and the originals will be deleted. This cannot be undone.',
+				{ title: 'Replace originals?', kind: 'warning', okLabel: 'Replace originals' }
+			);
+			if (!agreed) return;
+			onOutput('replace', null);
+			return;
+		}
+
+		if (mode === 'folder' && !outputDir) {
+			void pickFolder();
+			return;
+		}
+
+		// A remembered folder survives a detour through "ask", which still
+		// prompts per batch but may be switched back.
+		onOutput(mode, mode === 'beside' ? null : outputDir);
 	}
 
 	let shellBusy = $state(false);
@@ -126,13 +154,16 @@
 			value={outputMode}
 			onchange={(e) => {
 				const mode = e.currentTarget.value as OutputMode;
-				if (mode === 'folder' && !outputDir) void pickFolder();
-				else onOutput(mode, mode === 'beside' ? null : outputDir);
+				// The select shows the new value the moment it is clicked, so a
+				// declined confirmation has to be put back where it was.
+				e.currentTarget.value = outputMode;
+				void chooseMode(mode);
 			}}
 		>
 			<option value="beside">Next to the original</option>
 			<option value="folder">In a folder I choose</option>
 			<option value="ask">Ask me each time</option>
+			<option value="replace">Replace the original</option>
 		</select>
 	</label>
 
@@ -144,7 +175,14 @@
 			</button>
 		</div>
 	{/if}
-	{#if outputMode !== 'beside'}
+	{#if outputMode === 'replace'}
+		<p class="warn">
+			Each original is deleted once its compressed version is written in its place. The
+			compression is lossy and the original is not recoverable, so keep anything you cannot
+			re-download backed up elsewhere. A result that comes out no smaller than its source is
+			discarded instead, leaving that file alone.
+		</p>
+	{:else if outputMode !== 'beside'}
 		<p class="hint">
 			Files saved to their own folder keep the original's name — no "(compressed)" for Discord
 			to show everyone. Next to the original they must be renamed to avoid overwriting it.
