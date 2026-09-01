@@ -61,6 +61,10 @@ pub struct QueueItem {
     pub work_dir: PathBuf,
     pub image_format: ImageFormat,
     pub max_dimension: Option<u32>,
+    /// Where results were sent, kept so `output` can be worked out again at
+    /// write time rather than trusted from when the job was queued. `None`
+    /// means beside the original.
+    pub output_dir: Option<PathBuf>,
     /// Set when this job must displace its source: the path the finished file
     /// ends up at, which is the original's name carrying whatever extension
     /// the new format needs. `output` is then a scratch file beside it.
@@ -223,7 +227,7 @@ fn worker(
     tools: Arc<Mutex<Option<FfmpegTools>>>,
     listener: Listener,
 ) {
-    while let Some(item) = shared.next() {
+    while let Some(mut item) = shared.next() {
         let token = shared
             .tokens
             .lock()
@@ -250,6 +254,8 @@ fn worker(
         };
 
         listener(JobEvent::Started { id: item.id.clone() });
+
+        settle_output(&mut item);
 
         let request = CompressRequest {
             input: item.input.clone(),
@@ -338,6 +344,31 @@ fn settle(item: &QueueItem, outcome: MediaOutcome) -> JobEvent {
             }
         }
     }
+}
+
+/// Re-check where this job writes against the disk as it is now.
+///
+/// The path was chosen when the job was queued, which for a batch is before
+/// any of it ran — so two sources that resolve to one name were both handed
+/// it. `a/clip.mp4` and `b/clip.mp4` collected into one output folder is the
+/// easy way to hit this; two files differing only by container is the other.
+/// Without this the second job writes over the first one's finished result.
+///
+/// The worker takes one job at a time, so every earlier result is already on
+/// disk by the time this asks. Re-running the original resolution rather than
+/// bumping a counter onto the name keeps the convention that fits where the
+/// file is landing — "(compressed 2)" beside the source, "(2)" in a folder of
+/// its own.
+///
+/// A replacement is left alone: its scratch file is already unique per job,
+/// and its destination is re-checked after the encode instead.
+fn settle_output(item: &mut QueueItem) {
+    if item.replacement.is_some() || !item.output.exists() {
+        return;
+    }
+
+    let extension = item.output.extension().unwrap_or_default().to_string_lossy().to_string();
+    item.output = output_path_for(&item.input, &extension, item.output_dir.as_deref());
 }
 
 /// The destination, re-checked against the disk as it is now.
@@ -613,6 +644,7 @@ mod tests {
             work_dir: std::env::temp_dir().join("mc-queue-test"),
             image_format: ImageFormat::Webp,
             max_dimension: None,
+            output_dir: None,
             replacement: Some(destination.to_path_buf()),
         }
     }
@@ -747,6 +779,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn keeping_item(input: &Path, output: &Path, output_dir: Option<&Path>) -> QueueItem {
+        QueueItem {
+            id: "job-2".to_string(),
+            input: input.to_path_buf(),
+            output: output.to_path_buf(),
+            target: Target::new(20_000_000),
+            options: Options::default(),
+            speed: Speed::Fast,
+            work_dir: std::env::temp_dir().join("mc-queue-test"),
+            image_format: ImageFormat::Webp,
+            max_dimension: None,
+            output_dir: output_dir.map(Path::to_path_buf),
+            replacement: None,
+        }
+    }
+
+    /// Collecting same-named files from several folders into one output folder
+    /// hands every job the same destination, because they are all resolved
+    /// before any of them has written anything. The second encode would land
+    /// on the first one's result.
+    #[test]
+    fn a_second_job_does_not_write_over_an_earlier_result() {
+        let dir = scratch("settle-output-folder");
+        let out_dir = dir.join("out");
+        let first_source = dir.join("a");
+        let second_source = dir.join("b");
+        for path in [&out_dir, &first_source, &second_source] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+
+        std::fs::write(first_source.join("clip.mp4"), b"source one").unwrap();
+        let second = second_source.join("clip.mp4");
+        std::fs::write(&second, b"source two").unwrap();
+
+        // Both were queued against an empty folder, so both were told to write
+        // here. The first has since finished.
+        let contested = out_dir.join("clip.mp4");
+        std::fs::write(&contested, b"the first result").unwrap();
+
+        let mut item = keeping_item(&second, &contested, Some(&out_dir));
+        settle_output(&mut item);
+
+        assert_ne!(item.output, contested, "must step around the earlier result");
+        assert!(!item.output.exists(), "must pick a name nothing holds");
+        assert_eq!(
+            std::fs::read(&contested).unwrap(),
+            b"the first result",
+            "the earlier result must survive"
+        );
+        assert!(same_directory(item.output.parent().unwrap(), &out_dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-resolving has to reproduce the naming the mode calls for, not bolt a
+    /// counter onto the name it was given — "clip (compressed) (2).mp4" is not
+    /// what writing beside the source looks like.
+    #[test]
+    fn a_re_resolved_output_keeps_the_naming_of_its_mode() {
+        let dir = scratch("settle-output-beside");
+        let input = dir.join("clip.mov");
+        std::fs::write(&input, b"source").unwrap();
+
+        let taken = output_path_for(&input, "mp4", None);
+        std::fs::write(&taken, b"an earlier result").unwrap();
+
+        let mut item = keeping_item(&input, &taken, None);
+        settle_output(&mut item);
+
+        let name = item.output.file_name().unwrap().to_string_lossy().to_string();
+        assert_ne!(item.output, taken);
+        assert!(name.starts_with("clip (compressed"), "unexpected name {name:?}");
+        assert!(!name.contains(") ("), "counter was bolted on: {name:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The common case, and the one that must stay cheap: nothing holds the
+    /// path, so the job keeps exactly what it was queued with.
+    #[test]
+    fn an_uncontested_output_is_left_as_it_was() {
+        let dir = scratch("settle-output-free");
+        let input = dir.join("clip.mp4");
+        std::fs::write(&input, b"source").unwrap();
+
+        let chosen = output_path_for(&input, "mp4", None);
+        let mut item = keeping_item(&input, &chosen, None);
+        settle_output(&mut item);
+
+        assert_eq!(item.output, chosen);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A replacement stages under a name unique to its job, and its real
+    /// destination is settled after the encode. Re-resolving here would send
+    /// the encode somewhere the swap is not looking.
+    #[test]
+    fn a_replacement_scratch_file_is_never_re_resolved() {
+        let dir = scratch("settle-output-replacing");
+        let input = dir.join("clip.mp4");
+        std::fs::write(&input, b"source").unwrap();
+
+        let staged = staging_path_for(&input, "mp4", "job-1");
+        // A crash could have left one of these behind; it is ours to overwrite.
+        std::fs::write(&staged, b"stale scratch").unwrap();
+
+        let mut item = replacing_item(&input, &staged, &input);
+        settle_output(&mut item);
+
+        assert_eq!(item.output, staged);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Two sources in one batch differing only by container both resolve to
     /// `clip.mp4` when they are queued, and the second one finishes long after
     /// the first has written that file. Landing on it would destroy a result
@@ -861,6 +1008,7 @@ mod tests {
             work_dir: std::env::temp_dir().join("mc-queue-test"),
             image_format: ImageFormat::Webp,
             max_dimension: None,
+            output_dir: None,
             replacement: None,
         });
 
@@ -885,6 +1033,7 @@ mod tests {
             work_dir: std::env::temp_dir().join("mc-queue-test"),
             image_format: ImageFormat::Webp,
             max_dimension: None,
+            output_dir: None,
             replacement: None,
         }
     }
@@ -954,6 +1103,7 @@ mod tests {
             work_dir: std::env::temp_dir().join("mc-queue-test"),
             image_format: ImageFormat::Webp,
             max_dimension: None,
+            output_dir: None,
             replacement: None,
         };
 

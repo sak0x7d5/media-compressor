@@ -361,6 +361,9 @@ pub fn add_files(
             speed: settings.speed.unwrap_or_default(),
             image_format,
             max_dimension: settings.max_dimension,
+            // Carried through so the worker can resolve the path again once
+            // the jobs ahead of this one have actually written their results.
+            output_dir: output_dir.clone(),
             replacement,
             // Each job gets its own scratch directory so two-pass logs from one
             // can never be picked up by another.
