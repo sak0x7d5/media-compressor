@@ -26,8 +26,15 @@ export interface PresetFile {
 
 export interface FfmpegStatus {
 	installed: boolean;
-	version: string | null;
 	location: string | null;
+}
+
+/** Everything the first frame needs, fetched in one round trip. */
+export interface Startup {
+	ffmpeg: FfmpegStatus;
+	presets: PresetFile;
+	/** Paths this launch was handed on the command line. */
+	pending_files: string[];
 }
 
 export interface MediaInfo {
@@ -158,9 +165,21 @@ export interface PreviewPair {
 	at_seconds: number;
 }
 
+export const startup = () => invoke<Startup>('startup');
+
+/**
+ * Tell the backend the UI is populated, which is what makes the window
+ * visible. The window is created hidden so nobody watches an empty frame while
+ * the webview starts, so this must be called on every path out of boot,
+ * including the failing ones.
+ */
+export const uiReady = () => invoke<void>('ui_ready');
+
 export const listPresets = () => invoke<PresetFile>('list_presets');
 export const savePresets = (presets: PresetFile) => invoke<void>('save_presets', { presets });
 export const ffmpegStatus = () => invoke<FfmpegStatus>('ffmpeg_status');
+/** Runs `ffmpeg -version`, so it is asked for lazily rather than at startup. */
+export const ffmpegVersion = () => invoke<string | null>('ffmpeg_version');
 export const installFfmpeg = () => invoke<FfmpegStatus>('install_ffmpeg');
 export const probeFile = (path: string) => invoke<MediaInfo>('probe_file', { path });
 export const addFiles = (paths: string[], settings: EncodeSettings) =>
@@ -179,7 +198,6 @@ export const refreshPresets = (force = false) =>
 export const checkForUpdate = () => invoke<UpdateInfo | null>('check_for_update');
 export const installUpdate = () => invoke<void>('install_update');
 
-export const pendingFiles = () => invoke<string[]>('pending_files');
 export const previewPair = (before: string, after: string, atSeconds?: number) =>
 	invoke<PreviewPair>('preview_pair', { before, after, atSeconds });
 export const shellMenuStatus = () => invoke<boolean>('shell_menu_status');

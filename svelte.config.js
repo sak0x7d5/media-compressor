@@ -12,6 +12,14 @@ const config = {
     adapter: adapter({
       fallback: "index.html",
     }),
+    output: {
+      // One file, no module graph. The default split build asks the webview
+      // for a dozen scripts and stylesheets in sequence, and every one of them
+      // is a round trip through Tauri's custom protocol before anything can be
+      // drawn. There is one route here and it is all loaded up front anyway,
+      // so splitting it buys nothing and costs the whole startup.
+      bundleStrategy: "inline",
+    },
   },
 };
 
