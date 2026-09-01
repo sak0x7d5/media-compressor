@@ -1,33 +1,52 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import type { EncodeSettings, FfmpegStatus, OutputMode, PresetFile } from '$lib/ipc';
 	import { confirm, open } from '@tauri-apps/plugin-dialog';
-	import { checkForUpdate, installUpdate, setPresetsUrl, setShellMenu } from '$lib/ipc';
+	import {
+		checkForUpdate,
+		ffmpegVersion,
+		installUpdate,
+		setPresetsUrl,
+		setShellMenu,
+		shellMenuStatus
+	} from '$lib/ipc';
 
 	let {
 		settings,
 		status,
-		shellMenu,
 		presetsSourceUrl,
 		outputMode,
 		outputDir,
 		onChange,
-		onShellMenu,
 		onPresets,
 		onOutput,
 		onClose
 	}: {
 		settings: EncodeSettings;
 		status: FfmpegStatus | null;
-		shellMenu: boolean;
 		presetsSourceUrl: string;
 		outputMode: OutputMode;
 		outputDir: string | null;
 		onChange: (patch: Partial<EncodeSettings>) => void;
-		onShellMenu: (enabled: boolean) => void;
 		onPresets: (presets: PresetFile) => void;
 		onOutput: (mode: OutputMode, dir: string | null) => void;
 		onClose: () => void;
 	} = $props();
+
+	/* Both of these cost real work to answer — a registry read and an
+	   `ffmpeg -version` process — and neither is worth anything until this
+	   panel is open, so they are asked for here rather than at startup. */
+	let shellMenu = $state(false);
+	let version = $state<string | null>(null);
+
+	onMount(() => {
+		void (async () => {
+			shellMenu = await shellMenuStatus();
+		})();
+		void (async () => {
+			version = await ffmpegVersion();
+		})();
+	});
 
 	/**
 	 * Just the folder name, so a deep path does not blow out the row. Splits on
@@ -134,7 +153,7 @@
 		shellBusy = true;
 		shellError = null;
 		try {
-			onShellMenu(await setShellMenu(enabled));
+			shellMenu = await setShellMenu(enabled);
 		} catch (error) {
 			shellError = String(error);
 		} finally {
@@ -323,7 +342,9 @@
 	{/if}
 
 	<div class="foot">
-		<span class="mono">{status?.version ?? 'FFmpeg not installed'}</span>
+		<span class="mono">
+			{version ?? (status?.installed ? 'FFmpeg installed' : 'FFmpeg not installed')}
+		</span>
 	</div>
 </div>
 
