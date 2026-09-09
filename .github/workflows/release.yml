@@ -13,6 +13,12 @@
 #   2. The secret TAURI_SIGNING_PRIVATE_KEY is set, holding the contents of the
 #      private key file. Updates are refused by the app unless signed with it.
 #      Settings -> Secrets and variables -> Actions -> New repository secret.
+#
+# The tag must match the version in tauri.conf.json. That version is what ends
+# up in latest.json, so tagging v0.2.0 while the config still says 0.1.0 would
+# publish a release that every installed copy reads as "no newer version" — a
+# release nobody ever receives. The check below refuses that rather than let it
+# ship quietly.
 
 name: Release
 
@@ -57,6 +63,32 @@ jobs:
       - run: pnpm check
       - run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      # The one mistake this process can make silently. Catch it before the
+      # 20-minute build rather than after the release is already published.
+      - name: Check the tag matches the app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          configured=$(node -p "require('./src-tauri/tauri.conf.json').version")
+
+          if [ "$tagged" != "$configured" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match tauri.conf.json version $configured."
+            echo "::error::latest.json would advertise $configured, so no installed copy would take this update."
+            echo "::error::Set the version in src-tauri/tauri.conf.json, src-tauri/Cargo.toml and package.json to $tagged, then re-tag."
+            exit 1
+          fi
+
+          # Not fatal on their own — only tauri.conf.json reaches latest.json —
+          # but drift here is how the next release ends up mismatched.
+          for file in package.json src-tauri/Cargo.toml; do
+            case "$file" in
+              *.json) found=$(node -p "require('./$file').version") ;;
+              *)      found=$(grep -m1 '^version' "$file" | cut -d'"' -f2) ;;
+            esac
+            [ "$found" = "$tagged" ] || echo "::warning::$file says $found, not $tagged"
+          done
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -65,8 +97,12 @@ jobs:
           # empty rather than missing — the tool expects the variable to exist.
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Media Compressor ${{ github.ref_name }}'
+          # Empty on a manual run, which is what makes it build-only: given no
+          # tag, the action produces the installer without creating a release.
+          # Passing github.ref_name unconditionally would tag a draft release
+          # after whatever branch the run started from.
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('Media Compressor {0}', github.ref_name) || '' }}
           releaseBody: 'Installed copies will offer this update automatically.'
           releaseDraft: true
           prerelease: false

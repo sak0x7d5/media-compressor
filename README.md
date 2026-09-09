@@ -109,15 +109,31 @@ must carry a signature made with this project's private key, and the matching
 public key is compiled into the binary — a compromised download host cannot push
 anything the app will accept.
 
-Publishing a release is one command:
+Publishing a release is a version bump and a tag:
 
 ```bash
-git tag v0.2.0 && git push origin v0.2.0
+# The version in these three files is what the release actually contains.
+#   src-tauri/tauri.conf.json   ← the one that reaches latest.json
+#   src-tauri/Cargo.toml
+#   package.json
+git commit -am "release v0.2.0"
+git tag v0.2.0 && git push origin main v0.2.0
 ```
 
 That triggers a workflow which builds the installer, signs it, and publishes a
 draft release including a `latest.json` describing the new version. Installed
 copies check that file and offer the update.
+
+The tag has to match the version in `tauri.conf.json`, and the workflow stops if
+it doesn't. That version — not the tag — is what `latest.json` advertises, so
+tagging `v0.2.0` on a tree still saying `0.1.0` would publish a release every
+installed copy reads as "nothing newer here". It is the one mistake this process
+can make silently, which is why it is checked rather than documented and hoped
+for.
+
+Running the workflow by hand from the Actions tab builds the installer without
+publishing anything, which is the way to check it works before committing to a
+tag.
 
 **Two things must be true before the first release:**
 
