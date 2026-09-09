@@ -170,9 +170,16 @@ impl Queue {
 
 impl Drop for Queue {
     fn drop(&mut self) {
-        *self.shared.stopping.lock().unwrap() = true;
         self.cancel_all();
+
+        // `stopping` has to be set while holding `pending`, because that is the
+        // lock the worker is parked on. Setting it outside leaves a window
+        // where the worker has already read `stopping` as false but has not yet
+        // reached `wait`, so it misses the notification and parks forever.
+        let pending = self.shared.pending.lock().unwrap();
+        *self.shared.stopping.lock().unwrap() = true;
         self.shared.wake.notify_all();
+        drop(pending);
     }
 }
 
