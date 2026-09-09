@@ -109,9 +109,27 @@ fn default_margin() -> f64 {
     Target::DEFAULT_SAFETY_MARGIN
 }
 
+/// The narrowest and widest margins worth honouring.
+///
+/// Above 1.0 the app would plan *past* the very limit it exists to respect;
+/// below 0.5 it would throw away more than half the budget. Both are more
+/// likely to be a bad value than a real intention.
+const MIN_SAFETY_MARGIN: f64 = 0.5;
+const MAX_SAFETY_MARGIN: f64 = 1.0;
+
 impl EncodeSettings {
     fn target(&self) -> Target {
-        Target { limit_bytes: self.target_bytes, safety_margin: self.safety_margin }
+        // This number crosses from the frontend, so it is checked rather than
+        // trusted: a NaN would floor to a zero-byte budget and fail every job
+        // with "target too small", and anything over 1.0 would quietly aim
+        // above the cap and hand back a file the platform rejects.
+        let safety_margin = if self.safety_margin.is_finite() {
+            self.safety_margin.clamp(MIN_SAFETY_MARGIN, MAX_SAFETY_MARGIN)
+        } else {
+            Target::DEFAULT_SAFETY_MARGIN
+        };
+
+        Target { limit_bytes: self.target_bytes, safety_margin }
     }
 
     fn options(&self) -> Options {
@@ -174,17 +192,44 @@ pub async fn refresh_presets(app: AppHandle, force: bool) -> Result<Option<Prese
         .map_err(|e| format!("refresh task failed: {e}"))?
 }
 
-#[tauri::command]
-pub fn ffmpeg_status(state: State<'_, AppState>) -> FfmpegStatus {
+/// The located binaries, or the error the frontend shows when there are none.
+///
+/// Scoped so the mutex guard is released before any `.await` — holding a
+/// `std::sync::MutexGuard` across an await point is how an async command
+/// deadlocks itself.
+fn resolve_tools(app: &AppHandle) -> Result<FfmpegTools, String> {
+    let state = app.state::<AppState>();
     let guard = state.tools.lock().unwrap();
-    match guard.as_ref() {
-        Some(tools) => FfmpegStatus {
-            installed: true,
-            version: tools.version(),
-            location: Some(tools.ffmpeg.to_string_lossy().to_string()),
-        },
-        None => FfmpegStatus { installed: false, version: None, location: None },
-    }
+    guard.clone().ok_or_else(|| "FFmpeg is not installed yet".to_string())
+}
+
+/// Anything that shells out runs on a blocking thread rather than the main one.
+///
+/// Tauri runs a synchronous command on the main thread, which is also the
+/// thread that paints the window. `ffmpeg -version` is quick; pulling a frame
+/// out of a large file is not, and doing either there freezes the UI for as
+/// long as the child process takes.
+async fn off_thread<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("the task could not be run: {e}"))?
+}
+
+#[tauri::command]
+pub async fn ffmpeg_status(app: AppHandle) -> FfmpegStatus {
+    let Ok(tools) = resolve_tools(&app) else {
+        return FfmpegStatus { installed: false, version: None, location: None };
+    };
+
+    let location = Some(tools.ffmpeg.to_string_lossy().to_string());
+    // `version()` spawns ffmpeg, so it does not belong on the main thread.
+    let version = off_thread(move || Ok(tools.version())).await.unwrap_or(None);
+
+    FfmpegStatus { installed: true, version, location }
 }
 
 /// Download FFmpeg if it isn't already present.
@@ -214,9 +259,9 @@ pub async fn install_ffmpeg(app: AppHandle) -> Result<FfmpegStatus, String> {
 }
 
 #[tauri::command]
-pub fn probe_file(state: State<'_, AppState>, path: String) -> Result<MediaInfo, String> {
-    let tools = state.tools.lock().unwrap().clone().ok_or("FFmpeg is not installed yet")?;
-    probe(&tools, &PathBuf::from(path)).map_err(|e| e.to_string())
+pub async fn probe_file(app: AppHandle, path: String) -> Result<MediaInfo, String> {
+    let tools = resolve_tools(&app)?;
+    off_thread(move || probe(&tools, &PathBuf::from(path)).map_err(|e| e.to_string())).await
 }
 
 /// Queue one or more files for compression.
@@ -325,16 +370,23 @@ pub fn pending_files(state: State<'_, AppState>) -> Vec<String> {
 }
 
 /// A matched pair of frames from the original and the result.
+///
+/// This decodes up to two seek points in two files, which on a long clip is
+/// comfortably long enough to be noticed as a freeze if it ran on the main
+/// thread.
 #[tauri::command]
-pub fn preview_pair(
-    state: State<'_, AppState>,
+pub async fn preview_pair(
+    app: AppHandle,
     before: String,
     after: String,
     at_seconds: Option<f64>,
 ) -> Result<PreviewPair, String> {
-    let tools = state.tools.lock().unwrap().clone().ok_or("FFmpeg is not installed yet")?;
-    preview::compare(&tools, &PathBuf::from(before), &PathBuf::from(after), at_seconds)
-        .map_err(|e| e.to_string())
+    let tools = resolve_tools(&app)?;
+    off_thread(move || {
+        preview::compare(&tools, &PathBuf::from(before), &PathBuf::from(after), at_seconds)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -356,4 +408,57 @@ pub fn set_shell_menu(enabled: bool) -> Result<bool, String> {
 
     result.map_err(|e| e.to_string())?;
     Ok(shell_integration::is_registered())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(safety_margin: f64) -> EncodeSettings {
+        EncodeSettings {
+            target_bytes: 20_000_000,
+            safety_margin,
+            codec: None,
+            bias: None,
+            speed: None,
+            crf: None,
+            image_format: None,
+            max_dimension: None,
+            output_dir: None,
+        }
+    }
+
+    #[test]
+    fn an_ordinary_margin_is_passed_through_untouched() {
+        assert_eq!(settings(0.95).target().safety_margin, 0.95);
+        assert_eq!(settings(0.8).target().safety_margin, 0.8);
+    }
+
+    #[test]
+    fn a_margin_over_one_would_aim_past_the_cap_and_is_pulled_back() {
+        let target = settings(1.5).target();
+        assert_eq!(target.safety_margin, MAX_SAFETY_MARGIN);
+        assert!(
+            target.effective_bytes() <= target.limit_bytes,
+            "the planned size must never exceed the limit itself"
+        );
+    }
+
+    #[test]
+    fn a_margin_that_throws_away_most_of_the_budget_is_pulled_up() {
+        assert_eq!(settings(0.01).target().safety_margin, MIN_SAFETY_MARGIN);
+        assert_eq!(settings(0.0).target().safety_margin, MIN_SAFETY_MARGIN);
+        assert_eq!(settings(-3.0).target().safety_margin, MIN_SAFETY_MARGIN);
+    }
+
+    #[test]
+    fn a_non_finite_margin_falls_back_rather_than_zeroing_the_budget() {
+        // `NaN as u64` floors to 0, which would fail every job with
+        // "target too small" and give no clue why.
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let target = settings(value).target();
+            assert_eq!(target.safety_margin, Target::DEFAULT_SAFETY_MARGIN);
+            assert!(target.effective_bytes() > 0, "{value} produced an empty budget");
+        }
+    }
 }

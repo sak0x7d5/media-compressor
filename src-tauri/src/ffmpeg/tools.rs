@@ -113,8 +113,11 @@ impl FfmpegTools {
     }
 
     fn verify_one(kind: &'static str, path: &Path) -> Result<(), ToolsError> {
-        let output = Command::new(path)
-            .arg("-version")
+        let mut command = Command::new(path);
+        command.arg("-version");
+        crate::ffmpeg::hide_console(&mut command);
+
+        let output = command
             .output()
             .map_err(|source| ToolsError::NotRunnable { kind, path: path.to_path_buf(), source })?;
 
@@ -127,7 +130,11 @@ impl FfmpegTools {
 
     /// The version banner's first line, for display in Settings.
     pub fn version(&self) -> Option<String> {
-        let output = Command::new(&self.ffmpeg).arg("-version").output().ok()?;
+        let mut command = Command::new(&self.ffmpeg);
+        command.arg("-version");
+        crate::ffmpeg::hide_console(&mut command);
+
+        let output = command.output().ok()?;
         let banner = String::from_utf8_lossy(&output.stdout);
         banner.lines().next().map(|line| line.trim().to_string())
     }
