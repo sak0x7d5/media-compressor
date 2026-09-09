@@ -107,7 +107,32 @@ impl CompressError {
 }
 
 /// Compress whatever this is — video or still image — to fit under the target.
+///
+/// A run that ends in an error — cancelled, or FFmpeg giving up part way — has
+/// usually already written some of the output. That half-file is worse than
+/// nothing: it carries the name a finished result would have carried, it will
+/// not play, and the next run steps around it instead of reusing the name. So
+/// anything we created and did not finish is removed on the way out.
 pub fn compress_media(
+    tools: &FfmpegTools,
+    request: &CompressRequest,
+    cancel: &CancelToken,
+    on_stage: impl FnMut(Stage),
+) -> Result<MediaOutcome, CompressError> {
+    // Only ever delete a file this run brought into being. A path that was
+    // already occupied belongs to someone else, however this ends.
+    let pre_existing = request.output.exists();
+
+    let result = run_media(tools, request, cancel, on_stage);
+
+    if result.is_err() && !pre_existing {
+        let _ = std::fs::remove_file(&request.output);
+    }
+
+    result
+}
+
+fn run_media(
     tools: &FfmpegTools,
     request: &CompressRequest,
     cancel: &CancelToken,

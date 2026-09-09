@@ -10,7 +10,7 @@ use media_compressor_lib::ffmpeg::encode::{CancelToken, Speed};
 use media_compressor_lib::ffmpeg::probe::probe;
 use media_compressor_lib::ffmpeg::tools::FfmpegTools;
 use media_compressor_lib::images::ImageFormat;
-use media_compressor_lib::pipeline::{compress, CompressRequest, Stage};
+use media_compressor_lib::pipeline::{compress, compress_media, CompressRequest, Stage};
 use media_compressor_lib::strategy::plan::{Options, RateControl};
 use media_compressor_lib::strategy::Target;
 use std::path::{Path, PathBuf};
@@ -303,6 +303,84 @@ fn an_image_is_quality_searched_down_to_the_target() {
         "used only {} of a {target} byte budget",
         outcome.output_bytes
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cancelled job used to leave a multi-megabyte, unplayable `.mp4` sitting
+/// next to the original under exactly the name a finished result would have
+/// had. Whatever we started and did not finish has to go with us.
+#[test]
+fn cancelling_leaves_no_half_written_output_behind() {
+    let Some(tools) = tools() else {
+        eprintln!("skipping: no ffmpeg available");
+        return;
+    };
+
+    let dir = scratch("partial");
+    let input = dir.join("source.mp4");
+    let output = dir.join("out.mp4");
+
+    make_source(&tools, &input, 20, 1280, 720, 30);
+
+    let cancel = CancelToken::new();
+    let mut seen_progress = 0;
+
+    let result = compress_media(
+        &tools,
+        &request(&input, &output, &dir.join("work"), 20_000_000),
+        &cancel,
+        |stage| {
+            if matches!(stage, Stage::Encoding(_)) {
+                seen_progress += 1;
+                // Far enough in that ffmpeg has definitely written something.
+                if seen_progress >= 3 {
+                    cancel.cancel();
+                }
+            }
+        },
+    );
+
+    assert!(result.is_err(), "a cancelled job must not report success");
+    assert!(
+        !output.exists(),
+        "a partial output was left behind ({:?} bytes)",
+        std::fs::metadata(&output).map(|meta| meta.len())
+    );
+    assert!(input.is_file(), "the source must be untouched");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cleanup above must only ever remove a file this run created. A path that
+/// was already occupied belongs to someone else, however the job ends.
+#[test]
+fn a_pre_existing_file_at_the_output_path_is_never_deleted() {
+    let Some(tools) = tools() else {
+        eprintln!("skipping: no ffmpeg available");
+        return;
+    };
+
+    let dir = scratch("preexisting");
+    let input = dir.join("source.mp4");
+    let output = dir.join("out.mp4");
+
+    make_source(&tools, &input, 5, 320, 240, 15);
+    std::fs::write(&output, b"someone else's file").unwrap();
+
+    // Cancelled before it can start, so the job fails with the file in place.
+    let cancel = CancelToken::new();
+    cancel.cancel();
+
+    let result = compress_media(
+        &tools,
+        &request(&input, &output, &dir.join("work"), 20_000_000),
+        &cancel,
+        |_| {},
+    );
+
+    assert!(result.is_err(), "a cancelled job must not report success");
+    assert!(output.is_file(), "a file we did not create must survive");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
