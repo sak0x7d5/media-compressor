@@ -38,9 +38,12 @@
 	} from '$lib/ipc';
 
 	const CUSTOM = '__custom__';
+	/* Must stay in step with EXTENSIONS in shell_integration.rs: anything the
+	   Explorer menu offers has to be accepted here, or right-clicking a file the
+	   app itself advertised ends in "that file type is not supported". */
 	const MEDIA_EXTENSIONS = [
 		'mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v', 'wmv', 'flv', 'mpg', 'mpeg', 'ts', 'gif',
-		'png', 'jpg', 'jpeg', 'webp', 'avif', 'bmp', 'tiff'
+		'png', 'jpg', 'jpeg', 'webp', 'avif', 'bmp', 'tif', 'tiff'
 	];
 
 	const jobs = new JobList();

@@ -33,7 +33,11 @@
 	   that captured only the initial value would then show a stale number. */
 	let customMb = $state('');
 	$effect(() => {
-		customMb = String(Math.round(customBytes / 1_000_000));
+		// Shows the exact target rather than a rounded one. Rounding here made a
+		// typed "8.5" snap back to "9" the moment it was committed, while the
+		// app went on targeting 8.5 MB — the field and the target disagreed, and
+		// the field was the one that was wrong.
+		customMb = String(Number((customBytes / 1_000_000).toFixed(3)));
 	});
 
 	function commitCustom() {
