@@ -122,8 +122,28 @@ function stageStatus(stage: Stage): { status: string; fraction?: number; detail?
 	}
 }
 
+/**
+ * How many not-yet-known jobs we will hold events for.
+ *
+ * The buffer only ever holds events for ids the backend just handed us, so it
+ * drains almost immediately. The cap is here so that a stray id — one whose row
+ * is never created because the add failed — cannot grow the map forever.
+ */
+const MAX_BUFFERED_JOBS = 64;
+
 export class JobList {
 	jobs = $state<Job[]>([]);
+
+	/**
+	 * Events that arrived before their row existed.
+	 *
+	 * A row is created from what `add_files` returns, but the backend starts
+	 * work the moment the job is pushed — so `started` and, for a fast image,
+	 * even `finished` can reach the webview before that promise resolves.
+	 * Dropping those left the row stuck on "queued" with nothing able to move
+	 * it. Holding them and replaying on `add` removes the race entirely.
+	 */
+	#buffered = new Map<string, JobEvent[]>();
 
 	get active(): Job | undefined {
 		return this.jobs.find((job) => job.state === 'running');
@@ -158,11 +178,19 @@ export class JobList {
 				fraction: 0,
 				detail: formatBytes(file.input_bytes)
 			});
+
+			// Anything that happened while we were waiting for this row.
+			const held = this.#buffered.get(file.id);
+			if (held) {
+				this.#buffered.delete(file.id);
+				for (const event of held) this.apply(event);
+			}
 		}
 	}
 
 	remove(id: string) {
 		this.jobs = this.jobs.filter((job) => job.id !== id);
+		this.#buffered.delete(id);
 	}
 
 	clear() {
@@ -171,7 +199,10 @@ export class JobList {
 
 	apply(event: JobEvent) {
 		const job = this.jobs.find((candidate) => candidate.id === event.id);
-		if (!job) return;
+		if (!job) {
+			this.#buffer(event);
+			return;
+		}
 
 		switch (event.event) {
 			case 'queued':
@@ -215,5 +246,23 @@ export class JobList {
 				job.detail = 'cancelled';
 				break;
 		}
+	}
+
+	/** Hold an event until its row shows up. */
+	#buffer(event: JobEvent) {
+		const held = this.#buffered.get(event.id);
+		if (held) {
+			held.push(event);
+			return;
+		}
+
+		// Evict the oldest rather than grow without bound. Insertion order is
+		// what a Map iterates in, so the first key is the stalest.
+		if (this.#buffered.size >= MAX_BUFFERED_JOBS) {
+			const oldest = this.#buffered.keys().next();
+			if (!oldest.done) this.#buffered.delete(oldest.value);
+		}
+
+		this.#buffered.set(event.id, [event]);
 	}
 }
