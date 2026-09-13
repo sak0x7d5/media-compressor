@@ -1,7 +1,9 @@
-# Media Compressor
+# Too ~~broke~~ smart to buy Nitro? I gotcha.
 
-Drop a video or image in, name a size, get the best-looking file that fits under
-it — first try.
+Compress. Upload. Fail. Lower the bitrate. Repeat.
+
+**Or — drop it here once.** Media Compressor takes a video or an image and a
+target size, and hands back the best-looking file that fits under it. First try.
 
 Built because Discord caps attachments and keeps moving the cap: 25 MB → 8 → 25
 → 10 → **20 MB (13 August 2026)**. Nothing about this app is Discord-specific
