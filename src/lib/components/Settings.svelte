@@ -67,9 +67,10 @@
 			return;
 		}
 
-		// A remembered folder survives a detour through "ask", which still
-		// prompts per batch but may be switched back.
-		onOutput(mode, mode === 'beside' ? null : outputDir);
+		// Only these two have a folder to remember. "ask" keeps one so a
+		// detour through it can be switched back without picking again.
+		const carriesFolder = mode === 'folder' || mode === 'ask';
+		onOutput(mode, carriesFolder ? outputDir : null);
 	}
 
 	let shellBusy = $state(false);

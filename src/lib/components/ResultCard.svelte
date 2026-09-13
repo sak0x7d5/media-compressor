@@ -24,7 +24,10 @@
 	   is a worse outcome than a nearly-full one, not a better one. */
 	const usedFraction = $derived(limitBytes > 0 ? Math.min(outBytes / limitBytes, 1) : 0);
 	const overLimit = $derived(job.outcome ? !job.outcome.within_limit : false);
-	const barColor = $derived(overLimit ? 'var(--danger)' : 'var(--success)');
+	/* A replacement that was declined describes a file that was thrown away, so
+	   the card must not tick it off as a success. */
+	const declined = $derived(job.original === 'kept-not-smaller');
+	const barColor = $derived(overLimit || declined ? 'var(--danger)' : 'var(--success)');
 
 	/* Video counts re-encodes; an image counts quality probes. Both are "how
 	   many tries did this take", which is what the failure message needs. */
@@ -47,7 +50,7 @@
 		{#if onBack}
 			<button class="back" onclick={onBack} title="Back to the queue" aria-label="Back to the queue">‹</button>
 		{:else}
-			<span class="tick" style:color={barColor} aria-hidden="true">{overLimit ? '!' : '✓'}</span>
+			<span class="tick" style:color={barColor} aria-hidden="true">{overLimit || declined ? '!' : '✓'}</span>
 		{/if}
 		<span class="name" title={job.output}>{job.name}</span>
 		<span class="spec">{job.detail}</span>

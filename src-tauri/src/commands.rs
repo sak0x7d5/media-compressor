@@ -363,7 +363,12 @@ pub fn add_files(
             max_dimension: settings.max_dimension,
             // Carried through so the worker can resolve the path again once
             // the jobs ahead of this one have actually written their results.
-            output_dir: output_dir.clone(),
+            // Only a kept result is resolved again: a replacement stages under
+            // a name of its own and settles its destination after the encode.
+            output_dir: match disposition {
+                Disposition::Keep => output_dir.clone(),
+                Disposition::Replace => None,
+            },
             replacement,
             // Each job gets its own scratch directory so two-pass logs from one
             // can never be picked up by another.
