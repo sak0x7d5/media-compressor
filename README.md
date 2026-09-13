@@ -135,19 +135,19 @@ Running the workflow by hand from the Actions tab builds the installer without
 publishing anything, which is the way to check it works before committing to a
 tag.
 
-**Two things must be true before the first release:**
+**One thing must be true before the first release:**
 
-1. **The repository must be public.** Downloads from a private repository
-   require a login, so no installed copy could fetch an update. This is the only
-   thing currently keeping the feature dormant.
-2. **The `TAURI_SIGNING_PRIVATE_KEY` secret must be set** to the contents of the
-   private key file, under Settings → Secrets and variables → Actions. The key
-   lives outside this repository by design and must never be committed; losing
-   it means existing installs can never be updated again, because they will
-   reject anything signed with a different key.
+The **`TAURI_SIGNING_PRIVATE_KEY` secret must be set** to the contents of the
+private key file, under Settings → Secrets and variables → Actions. The key
+lives outside this repository by design and must never be committed; losing it
+means existing installs can never be updated again, because they will reject
+anything signed with a different key.
 
-Until both are done, the in-app check simply reports that it could not reach the
-update server, which is accurate and harmless.
+The repository also has to be public, so an installed copy can fetch
+`latest.json` without a login — that part is already done.
+
+Until the secret is set, the in-app check simply reports that it could not reach
+the update server, which is accurate and harmless.
 
 **Update support only works forward.** A copy of the app can only update itself
 if the build the user installed already contained the updater. Anyone running a
