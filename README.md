@@ -11,6 +11,71 @@ though; Discord is just the loudest preset.
 
 ---
 
+## "Why not just use one of those websites?"
+
+Because to compress a 400 MB clip on a website, you have to upload 400 MB first.
+
+That restates the problem rather than solving it. You have a file that is too big
+to send, and the proposed fix is to send it somewhere else — over the slowest
+link you own. Home connections upload several times slower than they download,
+so a few hundred megabytes is minutes of progress bar *before any compression
+has started*. Then a queue. Then a download.
+
+This encodes on the machine the file is already on. Nothing is uploaded.
+
+### The caveats stack up from there
+
+| | Browser-based compressor | This |
+|---|---|---|
+| Before it starts | Upload the entire file | Nothing — the file is already here |
+| Input size limit | Usually capped, often below the sizes that need compressing | Whatever your disk holds |
+| What you ask for | A quality preset, or a percentage | The exact number of bytes |
+| If it misses the cap | Lower a setting, re-upload, wait again | Measured and corrected automatically |
+| Resolution | Left alone, bitrate starved until it blocks | Fitted to the budget before encoding starts |
+| Several files | One at a time | A queue |
+| Privacy | Your footage sits on a stranger's server | Never leaves the machine |
+| Cost | Free tier, a watermark, or a subscription | Free |
+
+The input cap is the one worth dwelling on: **a compressor that rejects files
+over 100 MB only works on files you did not need to compress.** It fails at
+precisely the moment it becomes useful.
+
+In fairness, a few sites do let you type a target size. Almost none of them then
+*change the picture to fit it* — they hold your resolution and starve the
+bitrate, which is how you get 1080p that looks like wet paper. That decision is
+the entire subject of the next section.
+
+### Where a website stops, and this doesn't
+
+A website hands you a file in your Downloads folder. You still have to find it,
+drag it into Discord, and hope you grabbed the right one of the four you made.
+
+- **Copy** puts the result on the clipboard *as a file*. Ctrl+V in the Discord
+  message box attaches it — no folder, no dragging.
+- **Right-click → Compress for Discord** in Explorer, and it never has to be
+  opened in anything at all.
+- **Drop in twelve clips and walk away.** They encode one after another, because
+  two at once finish no sooner — they only make both progress bars lie.
+
+### Use something else if
+
+- **You are on a phone, a Chromebook, or a locked-down work machine.** A website
+  runs anywhere. This needs Windows and an install, and that is a real advantage
+  for the website, not a small one.
+- **You compress one file a year.** An install plus an 80 MB FFmpeg download to
+  save a single upload is a bad trade.
+- **You want the controls, not the answer.** Handbrake exposes every knob this
+  decides for you. If you already know which ones you want, use it.
+
+### And Nitro?
+
+Nitro raises the ceiling. It does not make anything smaller. It is a monthly fee,
+it has a limit of its own that you will eventually hit, and it does nothing for
+every other place you have to fit a file under a number. If you already pay for
+it, enjoy — you still cannot send a 400 MB clip.
+
+---
+
 ## What makes it different
 
 Most size-targeting tools do one of two things badly. They guess a bitrate and
