@@ -25,6 +25,11 @@ pub const EVENT_INSTALL: &str = "ffmpeg-install";
 
 pub struct AppState {
     pub tools: Arc<Mutex<Option<FfmpegTools>>>,
+    /// The `ffmpeg -version` banner, once something has paid for it.
+    ///
+    /// Only the Settings panel ever displays this, and asking for it means
+    /// spawning a 100 MB binary, so it is resolved lazily and then kept.
+    pub version: Arc<Mutex<Option<String>>>,
     pub queue: Queue,
     pub cache_dir: PathBuf,
     pub config_dir: PathBuf,
@@ -59,6 +64,7 @@ impl AppState {
 
         Self {
             tools,
+            version: Arc::new(Mutex::new(None)),
             queue,
             cache_dir,
             config_dir,
@@ -174,17 +180,41 @@ pub async fn refresh_presets(app: AppHandle, force: bool) -> Result<Option<Prese
         .map_err(|e| format!("refresh task failed: {e}"))?
 }
 
+/// Whether FFmpeg is present, and which build.
+///
+/// Async deliberately. A synchronous command body runs on the thread pumping
+/// the window's messages, and resolving the version banner spawns FFmpeg — on
+/// the first launch after a boot that is seconds of frozen UI for a string
+/// only the Settings panel reads.
 #[tauri::command]
-pub fn ffmpeg_status(state: State<'_, AppState>) -> FfmpegStatus {
-    let guard = state.tools.lock().unwrap();
-    match guard.as_ref() {
-        Some(tools) => FfmpegStatus {
-            installed: true,
-            version: tools.version(),
-            location: Some(tools.ffmpeg.to_string_lossy().to_string()),
-        },
-        None => FfmpegStatus { installed: false, version: None, location: None },
+pub async fn ffmpeg_status(app: AppHandle) -> FfmpegStatus {
+    let cache = Arc::clone(&app.state::<AppState>().version);
+
+    let Some(tools) = located_tools(&app) else {
+        return FfmpegStatus { installed: false, version: None, location: None };
+    };
+
+    let location = tools.ffmpeg.to_string_lossy().to_string();
+    let version = cached_version(&cache, tools).await;
+
+    FfmpegStatus { installed: true, version, location: Some(location) }
+}
+
+/// The binaries this run located at startup, if it found any.
+fn located_tools(app: &AppHandle) -> Option<FfmpegTools> {
+    app.state::<AppState>().tools.lock().unwrap().clone()
+}
+
+/// The version banner, asked of the binary at most once per run.
+async fn cached_version(cache: &Mutex<Option<String>>, tools: FfmpegTools) -> Option<String> {
+    let known = cache.lock().unwrap().clone();
+    if known.is_some() {
+        return known;
     }
+
+    let resolved = tauri::async_runtime::spawn_blocking(move || tools.version()).await.ok()??;
+    *cache.lock().unwrap() = Some(resolved.clone());
+    Some(resolved)
 }
 
 /// Download FFmpeg if it isn't already present.
@@ -195,6 +225,7 @@ pub async fn install_ffmpeg(app: AppHandle) -> Result<FfmpegStatus, String> {
     let state = app.state::<AppState>();
     let cache_dir = state.cache_dir.clone();
     let tools_slot = Arc::clone(&state.tools);
+    let version_slot = Arc::clone(&state.version);
 
     let emitter = app.clone();
     let installed = tauri::async_runtime::spawn_blocking(move || {
@@ -209,14 +240,23 @@ pub async fn install_ffmpeg(app: AppHandle) -> Result<FfmpegStatus, String> {
     let version = installed.version();
     let location = installed.ffmpeg.to_string_lossy().to_string();
     *tools_slot.lock().unwrap() = Some(installed);
+    *version_slot.lock().unwrap() = version.clone();
 
     Ok(FfmpegStatus { installed: true, version, location: Some(location) })
 }
 
+/// Ask ffprobe what a file contains.
+///
+/// Async for the same reason as [`ffmpeg_status`]: the spawn must not land on
+/// the thread pumping the window's messages.
 #[tauri::command]
-pub fn probe_file(state: State<'_, AppState>, path: String) -> Result<MediaInfo, String> {
-    let tools = state.tools.lock().unwrap().clone().ok_or("FFmpeg is not installed yet")?;
-    probe(&tools, &PathBuf::from(path)).map_err(|e| e.to_string())
+pub async fn probe_file(app: AppHandle, path: String) -> Result<MediaInfo, String> {
+    let tools = located_tools(&app).ok_or("FFmpeg is not installed yet")?;
+
+    tauri::async_runtime::spawn_blocking(move || probe(&tools, &PathBuf::from(path)))
+        .await
+        .map_err(|e| format!("probe task failed: {e}"))?
+        .map_err(|e| e.to_string())
 }
 
 /// Queue one or more files for compression.
@@ -325,16 +365,25 @@ pub fn pending_files(state: State<'_, AppState>) -> Vec<String> {
 }
 
 /// A matched pair of frames from the original and the result.
+///
+/// Extracting the two frames means running FFmpeg twice over files that may be
+/// long, so this runs off the UI thread — otherwise every comparison froze the
+/// window for as long as the seek took.
 #[tauri::command]
-pub fn preview_pair(
-    state: State<'_, AppState>,
+pub async fn preview_pair(
+    app: AppHandle,
     before: String,
     after: String,
     at_seconds: Option<f64>,
 ) -> Result<PreviewPair, String> {
-    let tools = state.tools.lock().unwrap().clone().ok_or("FFmpeg is not installed yet")?;
-    preview::compare(&tools, &PathBuf::from(before), &PathBuf::from(after), at_seconds)
-        .map_err(|e| e.to_string())
+    let tools = located_tools(&app).ok_or("FFmpeg is not installed yet")?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        preview::compare(&tools, &PathBuf::from(before), &PathBuf::from(after), at_seconds)
+    })
+    .await
+    .map_err(|e| format!("preview task failed: {e}"))?
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

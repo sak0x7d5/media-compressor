@@ -196,8 +196,11 @@
 	onMount(() => {
 		const unlisteners: Promise<UnlistenFn>[] = [];
 
+		// Off the critical path: the status carries FFmpeg's version banner, which
+		// costs a process spawn to read, and nothing below waits on the answer.
+		void ffmpegStatus().then((resolved) => (status = resolved));
+
 		(async () => {
-			status = await ffmpegStatus();
 			presets = await listPresets();
 			const fallback = presets.presets.find((preset) => preset.default) ?? presets.presets[0];
 			if (fallback) {
