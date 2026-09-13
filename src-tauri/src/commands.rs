@@ -377,6 +377,9 @@ pub async fn shell_menu_status() -> bool {
 /// they travel together.
 #[tauri::command]
 pub fn startup(state: State<'_, AppState>) -> Startup {
+    // The first IPC of the run: everything before this is webview boot.
+    crate::trace::mark("frontend: asked for startup state");
+
     Startup {
         ffmpeg: FfmpegStatus::of(state.tools.lock().unwrap().as_ref()),
         presets: presets::load(&state.config_dir),
@@ -392,6 +395,7 @@ pub fn startup(state: State<'_, AppState>) -> Startup {
 /// frontend that never gets this far.
 #[tauri::command]
 pub fn ui_ready(app: AppHandle) {
+    crate::trace::mark("frontend: reported ready");
     crate::reveal_main_window(&app);
 }
 

@@ -8,6 +8,7 @@ pub mod preview;
 pub mod queue;
 pub mod shell_integration;
 pub mod strategy;
+pub mod trace;
 pub mod updates;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +63,7 @@ pub fn reveal_main_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+    trace::mark("window shown");
 }
 
 /// Record that the window is already up, so nothing reveals it a second time.
@@ -111,9 +113,12 @@ pub fn run() {
         // The updater needs this to relaunch into the version it just installed.
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            trace::mark("setup: entered (window and webview created)");
+
             // The queue's worker thread needs an AppHandle to emit events, so
             // state is built here rather than before the builder runs.
             let state = commands::AppState::new(app.handle());
+            trace::mark("setup: app state built");
             let config_dir = state.config_dir.clone();
             app.manage(state);
             app.manage(WindowReveal::default());
@@ -135,6 +140,7 @@ pub fn run() {
                 let _ = presets::refresh(&config_dir, false);
             });
 
+            trace::mark("setup: done, waiting on the frontend");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
