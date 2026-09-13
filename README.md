@@ -1,4 +1,4 @@
-# Too ~~broke~~... I mean, too smart to buy Nitro? I gotcha.
+# Too ~~broke~~... I mean, too smart to buy Nitro? I GOTCHA!
 
 Compress. Upload. Fail. Lower the bitrate. Repeat.
 
