@@ -26,7 +26,8 @@ pub enum Disposition {
     /// The result is a new file and the original stays where it is.
     #[default]
     Keep,
-    /// The result takes the original's place and the original is deleted.
+    /// The result takes the original's place and the original goes to the
+    /// recycle bin.
     ///
     /// The encode still writes to a scratch file first: nothing is destroyed
     /// until there is a finished file ready to stand in its place.
@@ -298,10 +299,19 @@ fn worker(
 
 /// Turn a finished encode into the event the UI sees.
 ///
-/// This is the only place a source file is ever destroyed, and it happens
-/// after the encode rather than before it — by the time anything is removed
-/// there is a complete file ready to take its place.
+/// This is the only place a source file is ever given up, and it happens after
+/// the encode rather than before it — by the time anything moves there is a
+/// complete file ready to take its place.
 fn settle(item: &QueueItem, outcome: MediaOutcome) -> JobEvent {
+    settle_with(item, outcome, recycle)
+}
+
+/// The body of [`settle`], with the disposal step handed in for tests.
+fn settle_with(
+    item: &QueueItem,
+    outcome: MediaOutcome,
+    recycle: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> JobEvent {
     let Some(destination) = item.replacement.as_deref() else {
         return JobEvent::Finished {
             id: item.id.clone(),
@@ -327,7 +337,7 @@ fn settle(item: &QueueItem, outcome: MediaOutcome) -> JobEvent {
     }
 
     let destination = settled_destination(&item.input, destination);
-    match install_replacement(&item.input, &item.output, &destination) {
+    match install_replacement(&item.input, &item.output, &destination, recycle) {
         Ok(()) => JobEvent::Finished {
             id: item.id.clone(),
             output: destination.to_string_lossy().to_string(),
@@ -336,13 +346,24 @@ fn settle(item: &QueueItem, outcome: MediaOutcome) -> JobEvent {
         },
         // The encode is lost, but the source is not. Reporting why beats
         // leaving a scratch file behind and calling the job done.
-        Err(error) => {
+        Err(InstallError::Untouched(error)) => {
             let _ = std::fs::remove_file(&item.output);
             JobEvent::Failed {
                 id: item.id.clone(),
                 message: format!("could not replace the original: {error}"),
             }
         }
+        // Here the scratch file is the only copy of the encode, so it stays
+        // and the message says where. Clearing it as above would leave the
+        // user with nothing but a trip to the recycle bin.
+        Err(error @ InstallError::OriginalBinned(_)) => JobEvent::Failed {
+            id: item.id.clone(),
+            message: format!(
+                "the original is in the recycle bin, but the result could not take its name, \
+                 so it is still at {}: {error}",
+                item.output.display()
+            ),
+        },
     }
 }
 
@@ -390,28 +411,78 @@ fn settled_destination(input: &Path, chosen: &Path) -> PathBuf {
     replacement_path_for(input, &extension)
 }
 
+/// Why a replacement could not be installed, and what that leaves on disk.
+///
+/// The two cases want opposite things from the caller, which is the whole
+/// reason this is not a plain [`std::io::Error`]: one wants the scratch file
+/// cleared, the other must not lose it.
+#[derive(Debug)]
+enum InstallError {
+    /// Nothing moved. The original is where it was and the result is still at
+    /// its scratch path, so there is nothing to keep.
+    Untouched(std::io::Error),
+    /// The original reached the bin but the result could not take its name,
+    /// which leaves the encode as the only copy under the scratch name.
+    OriginalBinned(std::io::Error),
+}
+
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Untouched(error) | Self::OriginalBinned(error) => error.fmt(f),
+        }
+    }
+}
+
 /// Put a finished file in its source's place.
 ///
-/// The rename comes first and the delete second, so no moment exists in which
-/// neither file is there. Where the extension is unchanged the two are one
-/// path and the rename alone does it — `fs::rename` replaces an existing
-/// destination on both platforms, which is the atomic swap wanted here.
-fn install_replacement(original: &Path, staged: &Path, destination: &Path) -> std::io::Result<()> {
-    // Decided before the move, while both paths still describe real files: a
-    // rename that consumes the original leaves nothing left to compare.
+/// Where the extension changes, the two are different paths: the result goes
+/// in first and the source is cleared after, so no moment exists in which
+/// neither file is there. Where the extension is unchanged they are one path,
+/// and the source has to leave before the rename — `fs::rename` replaces an
+/// existing destination on both platforms, and an overwrite is the one
+/// disposal that cannot be sent anywhere.
+///
+/// The disposal step is handed in rather than called directly so tests can
+/// supply a bin of their own: the real one would put their fixtures in the
+/// user's recycle bin, and a machine running them may have no bin at all.
+fn install_replacement(
+    original: &Path,
+    staged: &Path,
+    destination: &Path,
+    recycle: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), InstallError> {
+    // Decided before anything moves, while both paths still describe real
+    // files: a rename that consumes the original leaves nothing left to
+    // compare.
     let destination_is_original = same_file(original, destination);
 
-    std::fs::rename(staged, destination)?;
+    if destination_is_original {
+        // The rename below lands on the original's own name and would erase it
+        // outright, so the original goes to the bin first and the result takes
+        // the freed name after.
+        recycle(original).map_err(InstallError::Untouched)?;
+        return std::fs::rename(staged, destination).map_err(InstallError::OriginalBinned);
+    }
+
+    std::fs::rename(staged, destination).map_err(InstallError::Untouched)?;
 
     // A format change lands the result under a new name — `clip.mov` becomes
     // `clip.mp4` — leaving the source behind to clear. The result is already
     // in place by now, so a source that refuses to go (open in a player, say)
     // is litter rather than a failed job.
-    if !destination_is_original {
-        let _ = std::fs::remove_file(original);
-    }
+    let _ = recycle(original);
 
     Ok(())
+}
+
+/// Send a file to the platform's recycle bin.
+///
+/// Never a plain delete. The file taking its place is lossily compressed and
+/// may be the only copy its owner has, so the disposal has to be one they can
+/// walk back — which is also why replacing is allowed to be a default at all.
+fn recycle(path: &Path) -> std::io::Result<()> {
+    trash::delete(path).map_err(std::io::Error::other)
 }
 
 /// Two directories that are the same place, as best we can tell.
@@ -633,6 +704,19 @@ mod tests {
         dir
     }
 
+    /// A stand-in recycle bin: moves the file into a folder of its own, so a
+    /// test can tell "sent to the bin" from "erased" without touching the
+    /// real one.
+    fn fake_bin(bin: &Path) -> impl FnOnce(&Path) -> std::io::Result<()> + '_ {
+        std::fs::create_dir_all(bin).unwrap();
+        move |path: &Path| std::fs::rename(path, bin.join(path.file_name().unwrap()))
+    }
+
+    /// A bin that refuses, for the paths that turn on disposal failing.
+    fn bin_that_refuses(path: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::other(format!("no bin for {}", path.display())))
+    }
+
     fn replacing_item(input: &Path, staged: &Path, destination: &Path) -> QueueItem {
         QueueItem {
             id: "job-1".to_string(),
@@ -723,13 +807,14 @@ mod tests {
     #[test]
     fn installing_a_same_format_replacement_swaps_the_contents_over() {
         let dir = scratch("install-same");
+        let bin = dir.join("recycle-bin");
         let input = dir.join("clip.mp4");
         std::fs::write(&input, b"the original").unwrap();
 
         let staged = staging_path_for(&input, "mp4", "job-1");
         std::fs::write(&staged, b"the compressed result").unwrap();
 
-        install_replacement(&input, &staged, &input).unwrap();
+        install_replacement(&input, &staged, &input, fake_bin(&bin)).unwrap();
 
         assert_eq!(std::fs::read(&input).unwrap(), b"the compressed result");
         assert!(!staged.exists(), "the scratch file must not linger");
@@ -740,6 +825,7 @@ mod tests {
     #[test]
     fn installing_a_new_format_replacement_clears_the_old_file() {
         let dir = scratch("install-new-ext");
+        let bin = dir.join("recycle-bin");
         let input = dir.join("clip.mov");
         std::fs::write(&input, b"the original").unwrap();
 
@@ -747,7 +833,7 @@ mod tests {
         let staged = staging_path_for(&input, "mp4", "job-1");
         std::fs::write(&staged, b"the compressed result").unwrap();
 
-        install_replacement(&input, &staged, &destination).unwrap();
+        install_replacement(&input, &staged, &destination, fake_bin(&bin)).unwrap();
 
         assert_eq!(std::fs::read(&destination).unwrap(), b"the compressed result");
         assert!(!input.exists(), "the source must be gone once its result is in place");
@@ -756,16 +842,135 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The point of the whole disposal step: a replaced original is recoverable.
+    /// A result that keeps the source's extension lands on the source's own
+    /// name, which is the case where a plain rename would erase it outright.
     #[test]
-    fn a_finished_replacement_reports_the_destination_rather_than_the_scratch_file() {
-        let dir = scratch("settle-replaced");
+    fn a_same_format_replacement_sends_the_original_to_the_bin() {
+        let dir = scratch("install-same-bins");
+        let bin = dir.join("recycle-bin");
+        let input = dir.join("clip.mp4");
+        std::fs::write(&input, b"the original").unwrap();
+
+        let staged = staging_path_for(&input, "mp4", "job-1");
+        std::fs::write(&staged, b"the compressed result").unwrap();
+
+        install_replacement(&input, &staged, &input, fake_bin(&bin)).unwrap();
+
+        assert_eq!(std::fs::read(&input).unwrap(), b"the compressed result");
+        assert_eq!(
+            std::fs::read(bin.join("clip.mp4")).unwrap(),
+            b"the original",
+            "the original must be recoverable, not erased"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Changing format leaves the source under its own name to clear, which is
+    /// the other route to disposal. It goes to the bin too.
+    #[test]
+    fn a_new_format_replacement_sends_the_original_to_the_bin() {
+        let dir = scratch("install-new-ext-bins");
+        let bin = dir.join("recycle-bin");
+        let input = dir.join("clip.mov");
+        std::fs::write(&input, b"the original").unwrap();
+
+        let destination = dir.join("clip.mp4");
+        let staged = staging_path_for(&input, "mp4", "job-1");
+        std::fs::write(&staged, b"the compressed result").unwrap();
+
+        install_replacement(&input, &staged, &destination, fake_bin(&bin)).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"the compressed result");
+        assert_eq!(
+            std::fs::read(bin.join("clip.mov")).unwrap(),
+            b"the original",
+            "the original must be recoverable, not erased"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bin that refuses must stop the swap dead rather than fall back to
+    /// erasing the file. Nothing has moved, so the caller is free to bin the
+    /// scratch file instead.
+    #[test]
+    fn a_bin_that_refuses_leaves_the_original_where_it_is() {
+        let dir = scratch("install-bin-refuses");
+        let input = dir.join("clip.mp4");
+        std::fs::write(&input, b"the original").unwrap();
+
+        let staged = staging_path_for(&input, "mp4", "job-1");
+        std::fs::write(&staged, b"the compressed result").unwrap();
+
+        let error = install_replacement(&input, &staged, &input, bin_that_refuses)
+            .expect_err("a refused bin must fail the install");
+
+        assert!(matches!(error, InstallError::Untouched(_)));
+        assert_eq!(std::fs::read(&input).unwrap(), b"the original", "the original must survive");
+        assert!(staged.exists(), "the result is still the caller's to clear");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The window the recycle-first order opens: between the original leaving
+    /// and the result taking its name, something else can claim it. The encode
+    /// is then the only copy of itself, so it has to be reported, not cleared.
+    #[test]
+    fn a_result_that_cannot_take_the_freed_name_is_kept_rather_than_discarded() {
+        let dir = scratch("settle-name-stolen");
+        let bin = dir.join("recycle-bin");
         let input = dir.join("clip.mp4");
         std::fs::write(&input, vec![0u8; 4096]).unwrap();
 
         let staged = staging_path_for(&input, "mp4", "job-1");
         std::fs::write(&staged, b"smaller").unwrap();
 
-        let event = settle(&replacing_item(&input, &staged, &input), image_result(7));
+        // Bins the original as any bin would, then takes the freed name with a
+        // directory, which a file can never be renamed onto.
+        let bin_dir = bin.clone();
+        let steal_the_name = move |path: &Path| -> std::io::Result<()> {
+            std::fs::create_dir_all(&bin_dir)?;
+            std::fs::rename(path, bin_dir.join(path.file_name().unwrap()))?;
+            std::fs::create_dir(path)
+        };
+
+        let item = replacing_item(&input, &staged, &input);
+        let event = settle_with(&item, image_result(7), steal_the_name);
+
+        match event {
+            JobEvent::Failed { message, .. } => {
+                assert!(
+                    message.contains(&staged.display().to_string()),
+                    "the message must say where the result actually is, got {message:?}"
+                );
+                assert!(message.contains("recycle bin"), "and that the original is in it");
+            }
+            other => panic!("expected a failed job, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            b"smaller",
+            "the only copy of the encode must not be cleared"
+        );
+        assert!(bin.join("clip.mp4").exists(), "and the original must be in the bin");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_finished_replacement_reports_the_destination_rather_than_the_scratch_file() {
+        let dir = scratch("settle-replaced");
+        let bin = dir.join("recycle-bin");
+        let input = dir.join("clip.mp4");
+        std::fs::write(&input, vec![0u8; 4096]).unwrap();
+
+        let staged = staging_path_for(&input, "mp4", "job-1");
+        std::fs::write(&staged, b"smaller").unwrap();
+
+        let event =
+            settle_with(&replacing_item(&input, &staged, &input), image_result(7), fake_bin(&bin));
 
         match event {
             JobEvent::Finished { output, original, .. } => {
@@ -901,6 +1106,7 @@ mod tests {
     #[test]
     fn a_second_replacement_does_not_land_on_the_first_ones_result() {
         let dir = scratch("settle-batch-collision");
+        let bin = dir.join("recycle-bin");
 
         let first_result = dir.join("clip.mp4");
         std::fs::write(&first_result, b"the result of compressing clip.mov").unwrap();
@@ -911,7 +1117,11 @@ mod tests {
         let staged = staging_path_for(&second, "mp4", "job-2");
         std::fs::write(&staged, b"smaller").unwrap();
 
-        let event = settle(&replacing_item(&second, &staged, &first_result), image_result(7));
+        let event = settle_with(
+            &replacing_item(&second, &staged, &first_result),
+            image_result(7),
+            fake_bin(&bin),
+        );
 
         match event {
             JobEvent::Finished { output, original, .. } => {
@@ -942,13 +1152,18 @@ mod tests {
     #[test]
     fn a_result_no_smaller_than_its_source_leaves_the_source_alone() {
         let dir = scratch("settle-not-smaller");
+        let bin = dir.join("recycle-bin");
         let input = dir.join("clip.mp4");
         std::fs::write(&input, b"the original").unwrap();
 
         let staged = staging_path_for(&input, "mp4", "job-1");
         std::fs::write(&staged, b"a bigger re-encode of the original").unwrap();
 
-        let event = settle(&replacing_item(&input, &staged, &input), image_result(34));
+        let event = settle_with(
+            &replacing_item(&input, &staged, &input),
+            image_result(34),
+            fake_bin(&bin),
+        );
 
         match event {
             JobEvent::Finished { output, original, .. } => {
@@ -966,6 +1181,7 @@ mod tests {
     #[test]
     fn a_job_that_keeps_its_original_touches_nothing() {
         let dir = scratch("settle-keep");
+        let bin = dir.join("recycle-bin");
         let input = dir.join("clip.mp4");
         let output = dir.join("clip (compressed).mp4");
         std::fs::write(&input, b"the original").unwrap();
@@ -973,7 +1189,7 @@ mod tests {
 
         let item = QueueItem { replacement: None, ..replacing_item(&input, &output, &input) };
 
-        match settle(&item, image_result(10)) {
+        match settle_with(&item, image_result(10), fake_bin(&bin)) {
             JobEvent::Finished { original, output: reported, .. } => {
                 assert_eq!(original, Original::Kept);
                 assert_eq!(PathBuf::from(reported), output);

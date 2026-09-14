@@ -28,11 +28,16 @@ pub const EVENT_INSTALL: &str = "ffmpeg-install";
 
 pub struct AppState {
     pub tools: Arc<Mutex<Option<FfmpegTools>>>,
+    /// The `ffmpeg -version` banner, once something has paid for it.
+    ///
+    /// Only the Settings panel ever displays this, and reading it means
+    /// spawning a 100 MB binary, so it is resolved lazily and then kept.
+    pub version: Arc<Mutex<Option<String>>>,
     pub queue: Queue,
     pub cache_dir: PathBuf,
     pub config_dir: PathBuf,
     pub work_root: PathBuf,
-    /// Paths this process was launched with, consumed once by the frontend.
+    /// Paths this process was launched with, consumed once by [`startup`].
     pub pending_files: Mutex<Vec<String>>,
     next_id: AtomicU64,
 }
@@ -62,6 +67,7 @@ impl AppState {
 
         Self {
             tools,
+            version: Arc::new(Mutex::new(None)),
             queue,
             cache_dir,
             config_dir,
@@ -78,11 +84,38 @@ impl AppState {
     }
 }
 
+/// Whether FFmpeg is here, and where.
+///
+/// Deliberately says nothing about *which* build it is: answering that means
+/// running `ffmpeg -version`, and this is the first thing startup asks for.
+/// See [`ffmpeg_version`].
 #[derive(Debug, Clone, Serialize)]
 pub struct FfmpegStatus {
     pub installed: bool,
-    pub version: Option<String>,
     pub location: Option<String>,
+}
+
+impl FfmpegStatus {
+    fn of(tools: Option<&FfmpegTools>) -> Self {
+        match tools {
+            Some(tools) => Self {
+                installed: true,
+                location: Some(tools.ffmpeg.to_string_lossy().to_string()),
+            },
+            None => Self { installed: false, location: None },
+        }
+    }
+}
+
+/// Everything the first frame needs, in one call.
+#[derive(Debug, Clone, Serialize)]
+pub struct Startup {
+    pub ffmpeg: FfmpegStatus,
+    pub presets: PresetFile,
+    /// Paths this launch was handed on the command line — the Explorer context
+    /// menu on a cold start. Consumed here, so this is the only place that
+    /// will ever report them.
+    pub pending_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,9 +250,9 @@ fn resolve_tools(app: &AppHandle) -> Result<FfmpegTools, String> {
 /// Anything that shells out runs on a blocking thread rather than the main one.
 ///
 /// Tauri runs a synchronous command on the main thread, which is also the
-/// thread that paints the window. `ffmpeg -version` is quick; pulling a frame
-/// out of a large file is not, and doing either there freezes the UI for as
-/// long as the child process takes.
+/// thread that paints the window. Pulling a frame out of a large file takes
+/// long enough that doing it there freezes the UI until the child process
+/// finishes.
 async fn off_thread<T, F>(work: F) -> Result<T, String>
 where
     T: Send + 'static,
@@ -230,17 +263,44 @@ where
         .map_err(|e| format!("the task could not be run: {e}"))?
 }
 
+/// Whether FFmpeg is present, and where.
+///
+/// Synchronous on purpose: it reads a lock and formats a path, with no process
+/// spawn anywhere in it, so there is nothing here worth taking off the UI
+/// thread. The version banner — the one expensive part — is
+/// [`ffmpeg_version`], which startup never asks for.
 #[tauri::command]
-pub async fn ffmpeg_status(app: AppHandle) -> FfmpegStatus {
-    let Ok(tools) = resolve_tools(&app) else {
-        return FfmpegStatus { installed: false, version: None, location: None };
+pub fn ffmpeg_status(state: State<'_, AppState>) -> FfmpegStatus {
+    FfmpegStatus::of(state.tools.lock().unwrap().as_ref())
+}
+
+/// The FFmpeg version banner, for the line at the bottom of Settings.
+///
+/// This spawns `ffmpeg -version` and waits for it, which on Windows costs
+/// anywhere from tens of milliseconds to several seconds the first time, once
+/// the antivirus has had its look at a freshly downloaded binary. So it runs
+/// off the UI thread and nothing on the startup path asks for it.
+///
+/// The answer cannot change while the app runs — the binary is replaced only
+/// by an install, which seeds the cache itself — so it is paid for once and
+/// then remembered, rather than on every visit to Settings.
+#[tauri::command]
+pub async fn ffmpeg_version(app: AppHandle) -> Option<String> {
+    let cache = Arc::clone(&app.state::<AppState>().version);
+
+    if let Some(known) = cache.lock().unwrap().clone() {
+        return Some(known);
+    }
+
+    let tools = {
+        let state = app.state::<AppState>();
+        let located = state.tools.lock().unwrap().clone();
+        located?
     };
 
-    let location = Some(tools.ffmpeg.to_string_lossy().to_string());
-    // `version()` spawns ffmpeg, so it does not belong on the main thread.
-    let version = off_thread(move || Ok(tools.version())).await.unwrap_or(None);
-
-    FfmpegStatus { installed: true, version, location }
+    let resolved = tauri::async_runtime::spawn_blocking(move || tools.version()).await.ok()??;
+    *cache.lock().unwrap() = Some(resolved.clone());
+    Some(resolved)
 }
 
 /// Download FFmpeg if it isn't already present.
@@ -251,6 +311,7 @@ pub async fn install_ffmpeg(app: AppHandle) -> Result<FfmpegStatus, String> {
     let state = app.state::<AppState>();
     let cache_dir = state.cache_dir.clone();
     let tools_slot = Arc::clone(&state.tools);
+    let version_slot = Arc::clone(&state.version);
 
     let emitter = app.clone();
     let installed = tauri::async_runtime::spawn_blocking(move || {
@@ -262,11 +323,14 @@ pub async fn install_ffmpeg(app: AppHandle) -> Result<FfmpegStatus, String> {
     .map_err(|e| format!("install task failed: {e}"))?
     .map_err(|e| e.to_string())?;
 
-    let version = installed.version();
     let location = installed.ffmpeg.to_string_lossy().to_string();
     *tools_slot.lock().unwrap() = Some(installed);
+    // A different binary is on disk now, so whatever banner was remembered for
+    // the last one no longer describes it. Cleared rather than re-read: only
+    // Settings wants the string, and it will ask when it is opened.
+    *version_slot.lock().unwrap() = None;
 
-    Ok(FfmpegStatus { installed: true, version, location: Some(location) })
+    Ok(FfmpegStatus { installed: true, location: Some(location) })
 }
 
 #[tauri::command]
@@ -402,16 +466,6 @@ pub fn reveal_in_folder(path: String) -> Result<(), String> {
     clipboard::reveal(&PathBuf::from(path)).map_err(|e| e.to_string())
 }
 
-/// Files this launch was handed on the command line.
-///
-/// The Explorer context menu starts us with paths in argv. The frontend asks
-/// for them once, on mount; subsequent launches arrive as `open-files` events
-/// through the single-instance plugin instead.
-#[tauri::command]
-pub fn pending_files(state: State<'_, AppState>) -> Vec<String> {
-    std::mem::take(&mut *state.pending_files.lock().unwrap())
-}
-
 /// A matched pair of frames from the original and the result.
 ///
 /// This decodes up to two seek points in two files, which on a long clip is
@@ -432,9 +486,41 @@ pub async fn preview_pair(
     .await
 }
 
+/// Reads the registry, so it runs off the UI thread like everything else that
+/// touches the outside world.
 #[tauri::command]
-pub fn shell_menu_status() -> bool {
-    shell_integration::is_registered()
+pub async fn shell_menu_status() -> bool {
+    tauri::async_runtime::spawn_blocking(shell_integration::is_registered).await.unwrap_or(false)
+}
+
+/// Everything the first frame needs, in a single round trip.
+///
+/// These were four separate invokes awaited one after another, which meant the
+/// window could not draw a populated UI until four IPC round trips had
+/// completed in sequence. They are independent, cheap and always all wanted, so
+/// they travel together.
+#[tauri::command]
+pub fn startup(state: State<'_, AppState>) -> Startup {
+    // The first IPC of the run: everything before this is webview boot.
+    crate::trace::mark("frontend: asked for startup state");
+
+    Startup {
+        ffmpeg: FfmpegStatus::of(state.tools.lock().unwrap().as_ref()),
+        presets: presets::load(&state.config_dir),
+        pending_files: std::mem::take(&mut *state.pending_files.lock().unwrap()),
+    }
+}
+
+/// The frontend has a UI worth looking at; show the window.
+///
+/// The window starts hidden so that nobody watches an empty frame while
+/// WebView2 boots. Calling this is what ends that — see
+/// [`crate::reveal_main_window`], which also has the timeout that covers a
+/// frontend that never gets this far.
+#[tauri::command]
+pub fn ui_ready(app: AppHandle) {
+    crate::trace::mark("frontend: reported ready");
+    crate::reveal_main_window(&app);
 }
 
 /// Add or remove the Explorer right-click entry.

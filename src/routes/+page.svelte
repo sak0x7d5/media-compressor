@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { getCurrentWebview } from '@tauri-apps/api/webview';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import type { UnlistenFn } from '@tauri-apps/api/event';
@@ -19,16 +19,14 @@
 		cancelAll,
 		cancelJob,
 		copyToClipboard,
-		ffmpegStatus,
 		installFfmpeg,
-		listPresets,
 		onInstallProgress,
 		onJobEvent,
 		onOpenFiles,
-		pendingFiles,
 		previewPair,
 		revealInFolder,
-		shellMenuStatus,
+		startup,
+		uiReady,
 		type EncodeSettings,
 		type FfmpegStatus,
 		type InstallProgress,
@@ -62,13 +60,13 @@
 	let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
 	let showSettings = $state(false);
-	let shellMenu = $state(false);
 
 	/* Where results go. "beside" writes next to the original, which is the
 	   default and needs no folder at all. */
 	let outputMode = $state<OutputMode>('beside');
-	/* Replacing is the one mode that destroys something, so it stays visible in
-	   the footer rather than only in the settings panel it was set from. */
+	/* Replacing is the one mode that gives up a file the user already had, so it
+	   stays visible in the footer rather than only in the settings panel it was
+	   set from. */
 	const replacing = $derived(outputMode === 'replace');
 	let outputDir = $state<string | null>(null);
 	let preview = $state<PreviewPair | null>(null);
@@ -208,25 +206,43 @@
 		}
 	}
 
-	onMount(() => {
-		const unlisteners: Promise<UnlistenFn>[] = [];
+	/**
+	 * Fill the UI in and show the window.
+	 *
+	 * The window is created hidden, so this is the only thing that makes the app
+	 * appear — which is why the reveal sits in `finally` and is awaited on a
+	 * settled DOM. A backend that failed to answer must still leave the user
+	 * with a window, and one that answered must not be shown mid-populate.
+	 */
+	async function boot() {
+		let launchedWith: string[] = [];
 
-		(async () => {
-			status = await ffmpegStatus();
-			presets = await listPresets();
+		try {
+			const initial = await startup();
+			status = initial.ffmpeg;
+			presets = initial.presets;
+			launchedWith = initial.pending_files;
+
 			const fallback = presets.presets.find((preset) => preset.default) ?? presets.presets[0];
 			if (fallback) {
 				selectedId = fallback.id;
 				customBytes = fallback.bytes;
 			}
+		} catch (error) {
+			flash(String(error));
+		} finally {
+			await tick();
+			void uiReady();
+		}
 
-			shellMenu = await shellMenuStatus();
+		// Files handed to us on the command line — the Explorer context menu
+		// path for a cold start. Queued after the reveal so a folder prompt has
+		// a window to sit in front of.
+		if (launchedWith.length > 0) await enqueue(launchedWith);
+	}
 
-			// Files handed to us on the command line — the Explorer context menu
-			// path for a cold start.
-			const queued = await pendingFiles();
-			if (queued.length > 0) await enqueue(queued);
-		})();
+	onMount(() => {
+		const unlisteners: Promise<UnlistenFn>[] = [];
 
 		unlisteners.push(onJobEvent((event) => jobs.apply(event)));
 		unlisteners.push(onInstallProgress((event) => (installProgress = event)));
@@ -245,6 +261,8 @@
 				}
 			})
 		);
+
+		void boot();
 
 		return () => {
 			clearTimeout(toastTimer);
@@ -299,7 +317,6 @@
 				<Settings
 					settings={{ ...options, target_bytes: limitBytes }}
 					{status}
-					{shellMenu}
 					presetsSourceUrl={presets?.source_url ?? ''}
 					{outputMode}
 					{outputDir}
@@ -308,7 +325,6 @@
 						outputDir = dir;
 					}}
 					onChange={(patch) => (options = { ...options, ...patch })}
-					onShellMenu={(enabled) => (shellMenu = enabled)}
 					onPresets={(next) => (presets = next)}
 					onClose={() => (showSettings = false)}
 				/>
