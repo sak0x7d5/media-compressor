@@ -68,12 +68,12 @@
 	 *
 	 * The setting sticks, so this is the last point at which anyone is thinking
 	 * about it — every drop after this silently consumes its original. Nothing
-	 * else in the app deletes a file the user already had.
+	 * else in the app touches a file the user already had.
 	 */
 	async function chooseMode(mode: OutputMode) {
 		if (mode === 'replace' && outputMode !== 'replace') {
 			const agreed = await confirm(
-				'Compressed files will take the place of the originals, and the originals will be deleted. This cannot be undone.',
+				'Compressed files will take the place of the originals, and the originals will go to the recycle bin.',
 				{ title: 'Replace originals?', kind: 'warning', okLabel: 'Replace originals' }
 			);
 			if (!agreed) return;
@@ -197,10 +197,10 @@
 	{/if}
 	{#if outputMode === 'replace'}
 		<p class="warn">
-			Each original is deleted once its compressed version is written in its place. The
-			compression is lossy and the original is not recoverable, so keep anything you cannot
-			re-download backed up elsewhere. A result that comes out no smaller than its source is
-			discarded instead, leaving that file alone.
+			Each original goes to the recycle bin once its compressed version is written in its
+			place. The compression is lossy, so the bin is the only way back to the file you had —
+			empty it and the original is gone. A result that comes out no smaller than its source
+			is discarded instead, leaving that file alone.
 		</p>
 	{:else if outputMode !== 'beside'}
 		<p class="hint">

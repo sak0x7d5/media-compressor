@@ -156,8 +156,9 @@ export interface EncodeSettings {
 export type Disposition = 'keep' | 'replace';
 
 /**
- * Where compressed files land. "replace" is the one destructive answer: the
- * result takes the original's name and the original is deleted.
+ * Where compressed files land. "replace" is the one answer that gives up a
+ * file the user already had: the result takes the original's name and the
+ * original goes to the recycle bin.
  */
 export type OutputMode = 'beside' | 'folder' | 'ask' | 'replace';
 

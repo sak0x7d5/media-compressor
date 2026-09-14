@@ -64,8 +64,9 @@
 	/* Where results go. "beside" writes next to the original, which is the
 	   default and needs no folder at all. */
 	let outputMode = $state<OutputMode>('beside');
-	/* Replacing is the one mode that destroys something, so it stays visible in
-	   the footer rather than only in the settings panel it was set from. */
+	/* Replacing is the one mode that gives up a file the user already had, so it
+	   stays visible in the footer rather than only in the settings panel it was
+	   set from. */
 	const replacing = $derived(outputMode === 'replace');
 	let outputDir = $state<string | null>(null);
 	let preview = $state<PreviewPair | null>(null);
