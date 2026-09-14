@@ -107,7 +107,7 @@ export interface ImageOutcome {
 export type MediaOutcome = VideoOutcome | ImageOutcome;
 
 /** What became of the source file, once the job finished. */
-export type Original = 'kept' | 'replaced' | 'kept-not-smaller';
+export type Original = 'kept' | 'replaced' | 'kept-not-smaller' | 'kept-over-limit';
 
 export type JobEvent =
 	| { event: 'queued'; id: string; input: string; output: string }

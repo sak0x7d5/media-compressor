@@ -48,6 +48,11 @@ pub enum Original {
     /// Replacement was asked for, but the result came out no smaller than the
     /// source, so the result was discarded and the original left alone.
     KeptNotSmaller,
+    /// Replacement was asked for, but the result never got under the target.
+    /// It is smaller, and it still will not upload — so the source stays,
+    /// because it is the copy that can still be re-encoded to something that
+    /// does fit. The result was discarded.
+    KeptOverLimit,
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +307,19 @@ fn worker(
 /// after the encode rather than before it — by the time anything is removed
 /// there is a complete file ready to take its place.
 fn settle(item: &QueueItem, outcome: MediaOutcome) -> JobEvent {
+    settle_with(item, outcome, recycle)
+}
+
+/// The body of [`settle`], with the recycle step handed in.
+///
+/// Tests supply their own. Giving up a file is the one thing here worth proving
+/// in detail, and proving it against the real recycle bin would mean every
+/// `cargo test` quietly filled the developer's own.
+fn settle_with(
+    item: &QueueItem,
+    outcome: MediaOutcome,
+    recycle: impl Fn(&Path) -> std::io::Result<()>,
+) -> JobEvent {
     let Some(destination) = item.replacement.as_deref() else {
         return JobEvent::Finished {
             id: item.id.clone(),
@@ -326,8 +344,22 @@ fn settle(item: &QueueItem, outcome: MediaOutcome) -> JobEvent {
         };
     }
 
+    // Missing the target is the one failure this whole app exists to avoid, and
+    // it is not a trade worth making: the source is lossless-relative-to-itself
+    // and can be encoded again at a looser target, while the result is a lossy
+    // file that still cannot be sent anywhere.
+    if !outcome.within_limit() {
+        let _ = std::fs::remove_file(&item.output);
+        return JobEvent::Finished {
+            id: item.id.clone(),
+            output: item.input.to_string_lossy().to_string(),
+            outcome,
+            original: Original::KeptOverLimit,
+        };
+    }
+
     let destination = settled_destination(&item.input, destination);
-    match install_replacement(&item.input, &item.output, &destination) {
+    match install_replacement(&item.input, &item.output, &destination, recycle) {
         Ok(()) => JobEvent::Finished {
             id: item.id.clone(),
             output: destination.to_string_lossy().to_string(),
@@ -337,7 +369,12 @@ fn settle(item: &QueueItem, outcome: MediaOutcome) -> JobEvent {
         // The encode is lost, but the source is not. Reporting why beats
         // leaving a scratch file behind and calling the job done.
         Err(error) => {
-            let _ = std::fs::remove_file(&item.output);
+            // Only while the source is still there to fall back on. If it has
+            // already gone to the bin, this scratch file is the only finished
+            // encode left standing and removing it would compound the failure.
+            if item.input.exists() {
+                let _ = std::fs::remove_file(&item.output);
+            }
             JobEvent::Failed {
                 id: item.id.clone(),
                 message: format!("could not replace the original: {error}"),
@@ -392,14 +429,25 @@ fn settled_destination(input: &Path, chosen: &Path) -> PathBuf {
 
 /// Put a finished file in its source's place.
 ///
-/// The rename comes first and the delete second, so no moment exists in which
-/// neither file is there. Where the extension is unchanged the two are one
-/// path and the rename alone does it — `fs::rename` replaces an existing
-/// destination on both platforms, which is the atomic swap wanted here.
-fn install_replacement(original: &Path, staged: &Path, destination: &Path) -> std::io::Result<()> {
+/// Where the extension changes the two are different names, so the result goes
+/// in first and the source is cleared after — no moment exists in which neither
+/// is there. Where the extension is unchanged they are one path, and a plain
+/// rename would obliterate the source with nothing kept back, so the source is
+/// binned first and the staged encode — a complete file throughout — takes the
+/// name it leaves.
+fn install_replacement(
+    original: &Path,
+    staged: &Path,
+    destination: &Path,
+    recycle: impl Fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     // Decided before the move, while both paths still describe real files: a
     // rename that consumes the original leaves nothing left to compare.
     let destination_is_original = same_file(original, destination);
+
+    if destination_is_original {
+        recycle(original)?;
+    }
 
     std::fs::rename(staged, destination)?;
 
@@ -408,10 +456,22 @@ fn install_replacement(original: &Path, staged: &Path, destination: &Path) -> st
     // in place by now, so a source that refuses to go (open in a player, say)
     // is litter rather than a failed job.
     if !destination_is_original {
-        let _ = std::fs::remove_file(original);
+        let _ = recycle(original);
     }
 
     Ok(())
+}
+
+/// Send a file to the platform's recycle bin.
+///
+/// Never a plain delete. What replaces it is lossy and is quite often the only
+/// copy that will ever exist, so the one step that destroys something has to be
+/// the one step the user can undo without us.
+///
+/// On Windows this initialises COM on the calling thread, which is why it is
+/// reached from the encode worker rather than the thread serving the UI.
+fn recycle(path: &Path) -> std::io::Result<()> {
+    trash::delete(path).map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 /// Two directories that are the same place, as best we can tell.
@@ -661,6 +721,29 @@ mod tests {
         })
     }
 
+    /// A stand-in recycle bin.
+    ///
+    /// It moves the file into a folder of its own, which is what the real one
+    /// does — and lets a test assert the original is *recoverable* rather than
+    /// merely gone, which is the whole point of not deleting outright.
+    fn fake_bin(bin: &Path) -> impl Fn(&Path) -> std::io::Result<()> + '_ {
+        move |path: &Path| {
+            std::fs::create_dir_all(bin)?;
+            std::fs::rename(path, bin.join(path.file_name().unwrap()))
+        }
+    }
+
+    /// The same result, except that it never got under the target.
+    fn missed_the_target(output_bytes: u64) -> MediaOutcome {
+        match image_result(output_bytes) {
+            MediaOutcome::Image(mut outcome) => {
+                outcome.within_limit = false;
+                MediaOutcome::Image(outcome)
+            }
+            other => other,
+        }
+    }
+
     #[test]
     fn a_replacement_keeping_its_format_lands_on_the_original_itself() {
         let dir = scratch("replace-same-ext");
@@ -729,10 +812,19 @@ mod tests {
         let staged = staging_path_for(&input, "mp4", "job-1");
         std::fs::write(&staged, b"the compressed result").unwrap();
 
-        install_replacement(&input, &staged, &input).unwrap();
+        let bin = dir.join("bin");
+        install_replacement(&input, &staged, &input, fake_bin(&bin)).unwrap();
 
         assert_eq!(std::fs::read(&input).unwrap(), b"the compressed result");
         assert!(!staged.exists(), "the scratch file must not linger");
+        // The name is reused, so the source can only survive by being moved
+        // aside first. That it is still readable is the difference between this
+        // and an overwrite.
+        assert_eq!(
+            std::fs::read(bin.join("clip.mp4")).unwrap(),
+            b"the original",
+            "the source must be recoverable, not destroyed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -747,11 +839,17 @@ mod tests {
         let staged = staging_path_for(&input, "mp4", "job-1");
         std::fs::write(&staged, b"the compressed result").unwrap();
 
-        install_replacement(&input, &staged, &destination).unwrap();
+        let bin = dir.join("bin");
+        install_replacement(&input, &staged, &destination, fake_bin(&bin)).unwrap();
 
         assert_eq!(std::fs::read(&destination).unwrap(), b"the compressed result");
         assert!(!input.exists(), "the source must be gone once its result is in place");
         assert!(!staged.exists(), "the scratch file must not linger");
+        assert_eq!(
+            std::fs::read(bin.join("clip.mov")).unwrap(),
+            b"the original",
+            "the source must be recoverable, not destroyed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -765,7 +863,9 @@ mod tests {
         let staged = staging_path_for(&input, "mp4", "job-1");
         std::fs::write(&staged, b"smaller").unwrap();
 
-        let event = settle(&replacing_item(&input, &staged, &input), image_result(7));
+        let bin = dir.join("bin");
+        let event =
+            settle_with(&replacing_item(&input, &staged, &input), image_result(7), fake_bin(&bin));
 
         match event {
             JobEvent::Finished { output, original, .. } => {
@@ -911,7 +1011,12 @@ mod tests {
         let staged = staging_path_for(&second, "mp4", "job-2");
         std::fs::write(&staged, b"smaller").unwrap();
 
-        let event = settle(&replacing_item(&second, &staged, &first_result), image_result(7));
+        let bin = dir.join("bin");
+        let event = settle_with(
+            &replacing_item(&second, &staged, &first_result),
+            image_result(7),
+            fake_bin(&bin),
+        );
 
         match event {
             JobEvent::Finished { output, original, .. } => {
@@ -948,7 +1053,9 @@ mod tests {
         let staged = staging_path_for(&input, "mp4", "job-1");
         std::fs::write(&staged, b"a bigger re-encode of the original").unwrap();
 
-        let event = settle(&replacing_item(&input, &staged, &input), image_result(34));
+        let event = settle_with(&replacing_item(&input, &staged, &input), image_result(34), |_| {
+            panic!("nothing should be given up when the result is no smaller")
+        });
 
         match event {
             JobEvent::Finished { output, original, .. } => {
@@ -958,6 +1065,45 @@ mod tests {
             other => panic!("expected a finished job, got {other:?}"),
         }
         assert_eq!(std::fs::read(&input).unwrap(), b"the original", "the source must survive");
+        assert!(!staged.exists(), "the discarded result must not linger");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Smaller is not the bar — fitting is. A result that missed the target is
+    /// a lossy file that still cannot be sent anywhere, and taking the source's
+    /// place would leave nothing to re-encode from at a looser target. The one
+    /// case where the source is strictly more valuable than a smaller file.
+    #[test]
+    fn a_result_that_missed_the_target_leaves_the_source_alone() {
+        let dir = scratch("settle-over-limit");
+        let input = dir.join("clip.mp4");
+        std::fs::write(&input, vec![0u8; 4096]).unwrap();
+
+        let staged = staging_path_for(&input, "mp4", "job-1");
+        // Genuinely smaller, so only the limit stands between it and the swap.
+        std::fs::write(&staged, vec![0u8; 512]).unwrap();
+
+        let settled = settle_with(&replacing_item(&input, &staged, &input), missed_the_target(512), |_| {
+            panic!("nothing should be given up when the result missed the target")
+        });
+        match settled {
+            JobEvent::Finished { output, original, .. } => {
+                assert_eq!(original, Original::KeptOverLimit);
+                assert_eq!(
+                    PathBuf::from(output),
+                    input,
+                    "the surviving file is what the UI must act on"
+                );
+            }
+            other => panic!("expected a finished job, got {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::metadata(&input).unwrap().len(),
+            4096,
+            "the source must be untouched"
+        );
         assert!(!staged.exists(), "the discarded result must not linger");
 
         let _ = std::fs::remove_dir_all(&dir);

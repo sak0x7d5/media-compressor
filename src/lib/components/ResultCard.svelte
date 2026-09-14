@@ -26,7 +26,9 @@
 	const overLimit = $derived(job.outcome ? !job.outcome.within_limit : false);
 	/* A replacement that was declined describes a file that was thrown away, so
 	   the card must not tick it off as a success. */
-	const declined = $derived(job.original === 'kept-not-smaller');
+	const declined = $derived(
+		job.original === 'kept-not-smaller' || job.original === 'kept-over-limit'
+	);
 	const barColor = $derived(overLimit || declined ? 'var(--danger)' : 'var(--success)');
 
 	/* Video counts re-encodes; an image counts quality probes. Both are "how
@@ -86,6 +88,12 @@
 		<p class="warning">
 			The compressed version came out no smaller than the original, so it was discarded and
 			your file was left as it was.
+		</p>
+	{:else if job.original === 'kept-over-limit'}
+		<p class="warning">
+			The compressed version never got under the limit, so it was discarded rather than put in
+			your file's place — replacing would have left you with something that still will not
+			upload, and nothing to try again from. Your file was left as it was.
 		</p>
 	{/if}
 

@@ -158,13 +158,13 @@ Four choices, in Settings:
 | Next to the original *(default)* | `clip (compressed).mp4` | untouched |
 | In a folder I choose | `clip.mp4`, in that folder | untouched |
 | Ask me each time | `clip.mp4`, in the folder picked per batch | untouched |
-| Replace the original | `clip.mp4`, where `clip.mp4` was | **deleted** |
+| Replace the original | `clip.mp4`, where `clip.mp4` was | **recycle bin** |
 
 A result landing in a folder of its own keeps the source's exact name; sharing a
 folder with the source it has to be distinguished, hence the suffix. Names
 matter here because Discord shows the filename to everyone in the channel.
 
-**Replacing deletes files you already had, and lossy compression is not
+**Replacing gives up files you already had, and lossy compression is not
 reversible.** It is off by default, asks for confirmation the first time it is
 switched on, and the footer says `replacing originals` for as long as it stays
 on. What it does not do:
@@ -178,6 +178,12 @@ on. What it does not do:
 - It never trades a file for a worse one. A result that comes out no smaller
   than its source is discarded and the original left alone — that outcome would
   be larger *and* re-encoded.
+- It never trades a file for one that still doesn't fit. A result that missed
+  the target is discarded too: it is smaller, and it will not upload either, so
+  taking the source's place would leave nothing to encode again from at a
+  looser target.
+- It never deletes outright. The original goes to the recycle bin, so the one
+  step that gives something up is the one step you can undo without us.
 
 A format change replaces across the extension: compressing `clip.mov` leaves
 `clip.mp4` and no `clip.mov`. Comparing before and after is unavailable for a
