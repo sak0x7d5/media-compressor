@@ -28,6 +28,11 @@ pub const EVENT_INSTALL: &str = "ffmpeg-install";
 
 pub struct AppState {
     pub tools: Arc<Mutex<Option<FfmpegTools>>>,
+    /// The `ffmpeg -version` banner, once something has paid for it.
+    ///
+    /// Only the Settings panel ever displays this, and reading it means
+    /// spawning a 100 MB binary, so it is resolved lazily and then kept.
+    pub version: Arc<Mutex<Option<String>>>,
     pub queue: Queue,
     pub cache_dir: PathBuf,
     pub config_dir: PathBuf,
@@ -62,6 +67,7 @@ impl AppState {
 
         Self {
             tools,
+            version: Arc::new(Mutex::new(None)),
             queue,
             cache_dir,
             config_dir,
@@ -274,15 +280,27 @@ pub fn ffmpeg_status(state: State<'_, AppState>) -> FfmpegStatus {
 /// anywhere from tens of milliseconds to several seconds the first time, once
 /// the antivirus has had its look at a freshly downloaded binary. So it runs
 /// off the UI thread and nothing on the startup path asks for it.
+///
+/// The answer cannot change while the app runs — the binary is replaced only
+/// by an install, which seeds the cache itself — so it is paid for once and
+/// then remembered, rather than on every visit to Settings.
 #[tauri::command]
 pub async fn ffmpeg_version(app: AppHandle) -> Option<String> {
+    let cache = Arc::clone(&app.state::<AppState>().version);
+
+    if let Some(known) = cache.lock().unwrap().clone() {
+        return Some(known);
+    }
+
     let tools = {
         let state = app.state::<AppState>();
         let located = state.tools.lock().unwrap().clone();
         located?
     };
 
-    tauri::async_runtime::spawn_blocking(move || tools.version()).await.ok().flatten()
+    let resolved = tauri::async_runtime::spawn_blocking(move || tools.version()).await.ok()??;
+    *cache.lock().unwrap() = Some(resolved.clone());
+    Some(resolved)
 }
 
 /// Download FFmpeg if it isn't already present.
@@ -293,6 +311,7 @@ pub async fn install_ffmpeg(app: AppHandle) -> Result<FfmpegStatus, String> {
     let state = app.state::<AppState>();
     let cache_dir = state.cache_dir.clone();
     let tools_slot = Arc::clone(&state.tools);
+    let version_slot = Arc::clone(&state.version);
 
     let emitter = app.clone();
     let installed = tauri::async_runtime::spawn_blocking(move || {
@@ -306,6 +325,10 @@ pub async fn install_ffmpeg(app: AppHandle) -> Result<FfmpegStatus, String> {
 
     let location = installed.ffmpeg.to_string_lossy().to_string();
     *tools_slot.lock().unwrap() = Some(installed);
+    // A different binary is on disk now, so whatever banner was remembered for
+    // the last one no longer describes it. Cleared rather than re-read: only
+    // Settings wants the string, and it will ask when it is opened.
+    *version_slot.lock().unwrap() = None;
 
     Ok(FfmpegStatus { installed: true, location: Some(location) })
 }
