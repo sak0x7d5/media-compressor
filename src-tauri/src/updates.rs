@@ -15,6 +15,7 @@
 //! this on — no code change.
 
 use serde::Serialize;
+use std::time::Duration;
 use tauri::AppHandle;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -75,7 +76,14 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
     app.restart();
 }
 
-/// Check quietly in the background at startup.
+/// How long to leave startup alone before asking about updates.
+///
+/// A cold DNS lookup and TLS handshake want the same moments the window is
+/// trying to appear in, and nothing about an update is urgent enough to
+/// compete for them.
+const STARTUP_DELAY: Duration = Duration::from_secs(5);
+
+/// Check quietly in the background, shortly after startup.
 ///
 /// Failure is silent by design. Someone compressing a video does not need a
 /// dialog because a release server was unreachable, and while the repository is
@@ -83,6 +91,7 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
 pub fn check_in_background(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(STARTUP_DELAY).await;
         if let Ok(updater) = app.updater() {
             let _ = updater.check().await;
         }
