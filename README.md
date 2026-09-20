@@ -62,8 +62,8 @@ drag it into Discord, and hope you grabbed the right one of the four you made.
 - **You are on a phone, a Chromebook, or a locked-down work machine.** A website
   runs anywhere. This needs Windows and an install, and that is a real advantage
   for the website, not a small one.
-- **You compress one file a year.** An install plus an 80 MB FFmpeg download to
-  save a single upload is a bad trade.
+- **You compress one file a year.** An install — plus an 80 MB FFmpeg download,
+  if you don't already have one — to save a single upload is a bad trade.
 - **You want the controls, not the answer.** Handbrake exposes every knob this
   decides for you. If you already know which ones you want, use it.
 
@@ -192,20 +192,49 @@ replaced file, because there is no longer a "before" to read.
 
 ## FFmpeg
 
-FFmpeg does all the actual encoding. It isn't bundled — on first run the app
-downloads a build (~80 MB) into its own app-data folder and verifies the
-binaries execute before accepting the install.
+FFmpeg does all the actual encoding, and it isn't bundled. Three places are
+searched, in this order:
 
-On integrity: the upstream download URL is a rolling "latest" build with no
-published per-build hash, so a pinned checksum isn't achievable against it. What
-*is* enforced is HTTPS, and that the extracted binaries actually run — which is
-what catches a truncated or corrupted download. The archive hash and resolved
-version are recorded in `install.json` next to the binaries so a later launch can
-detect the install changing underneath it.
+1. **The app's own copy**, in its app-data folder. Whatever an existing install
+   is already using stays in use — an ordinary launch never switches encoders
+   behind your back.
+2. **`MEDIA_COMPRESSOR_FFMPEG`**, a directory containing `ffmpeg` and `ffprobe`.
+   Exempt from the check below: its whole purpose is pointing the app at an
+   unusual build deliberately.
+3. **Your PATH** — an FFmpeg you already have.
 
-Set `MEDIA_COMPRESSOR_FFMPEG` to a directory containing `ffmpeg` and `ffprobe` to
-use a specific build instead. Debug builds additionally fall back to PATH, so
-`pnpm tauri dev` works without waiting for a download.
+Only if none of those turn anything up does it download one (~80 MB), into its
+own folder, verifying the binaries execute before accepting the install.
+
+### On trusting the FFmpeg you already have
+
+Builds differ in which encoders were compiled in, and one missing encoder
+otherwise surfaces minutes later as a dead job on a file you already dropped. So
+a build on PATH is adopted only after being asked, out loud, whether it has
+every encoder this app can ask for — `libx264`, `libx265` and `libsvtav1`, a
+list derived from `VideoCodec` so it cannot drift.
+
+That costs one `ffmpeg -encoders` the first time and nothing afterwards: the
+answer is cached in `system.json` next to the binary's size and timestamp, and
+a build that changes underneath us fails that match and gets asked again. If
+your FFmpeg doesn't make the bar, the first-run screen says which encoder it
+lacks rather than downloading in silence.
+
+Settings shows which of the three is in use and lets you move between the two
+that are yours to choose: download a private copy while using your own, or
+switch to your own and delete the private copy.
+
+### On integrity
+
+The upstream download URL is a rolling "latest" build with no published
+per-build hash, so a pinned checksum isn't achievable against it. What *is*
+enforced is HTTPS, and that the extracted binaries actually run — which is what
+catches a truncated or corrupted download. The archive hash and resolved version
+are recorded in `install.json` next to the binaries so a later launch can detect
+the install changing underneath it.
+
+The archive also carries `ffplay`, which this app never launches; it is deleted
+after unpacking rather than left as another 90 MB of someone's disk.
 
 ---
 

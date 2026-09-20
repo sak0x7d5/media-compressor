@@ -9,12 +9,24 @@ pub mod acquire;
 pub mod encode;
 pub mod probe;
 pub mod sample;
+pub mod system;
 pub mod tools;
 
 pub use acquire::{AcquireError, AcquireProgress};
 pub use encode::{CancelToken, EncodeError, EncodeJob, EncodeProgress, Speed};
 pub use probe::{probe, ProbeError};
-pub use tools::{FfmpegTools, ToolsError};
+pub use tools::{FfmpegTools, ToolsError, ToolsSource};
+
+/// The FFmpeg this launch will use, or `None` if one has to be downloaded.
+///
+/// Order matters and is not arbitrary. The app's own copy wins because it is
+/// the one we verified and the one an existing install is already using —
+/// switching someone to a different encoder behind their back on an ordinary
+/// launch would be a surprise. Only when there is no copy of ours does a build
+/// already on the machine get considered, and then only on its merits.
+pub fn resolve(cache_dir: &std::path::Path) -> Option<FfmpegTools> {
+    FfmpegTools::locate(cache_dir).ok().or_else(|| system::adopt(cache_dir))
+}
 
 /// Stop Windows opening a console window for a child process.
 ///

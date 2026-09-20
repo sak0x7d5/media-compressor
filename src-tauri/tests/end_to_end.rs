@@ -12,13 +12,16 @@ use media_compressor_lib::ffmpeg::tools::FfmpegTools;
 use media_compressor_lib::images::ImageFormat;
 use media_compressor_lib::pipeline::{compress, compress_media, CompressRequest, Stage};
 use media_compressor_lib::strategy::plan::{Options, RateControl};
-use media_compressor_lib::strategy::Target;
+use media_compressor_lib::strategy::{Target, VideoCodec};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn tools() -> Option<FfmpegTools> {
-    let cache = std::env::temp_dir().join("media-compressor-nonexistent-cache");
-    let found = FfmpegTools::locate(&cache).ok()?;
+    // Same resolution the app uses, so these run against whatever FFmpeg the
+    // machine actually offers — including one on PATH, which is how they find
+    // anything on a dev box that has never run the installer.
+    let cache = std::env::temp_dir().join("media-compressor-e2e-cache");
+    let found = media_compressor_lib::ffmpeg::resolve(&cache)?;
     found.verify().ok()?;
     Some(found)
 }
@@ -61,6 +64,47 @@ fn request(input: &Path, output: &Path, work: &Path, limit: u64) -> CompressRequ
         work_dir: work.to_path_buf(),
         image_format: ImageFormat::Webp,
         max_dimension: None,
+    }
+}
+
+/// The encoder check, against a real build rather than a fixture.
+///
+/// What it can assert depends on the machine, so it does not assume the build
+/// has any particular encoder. It asserts the thing that must hold everywhere:
+/// that our answer matches what `ffmpeg -encoders` actually printed. That is
+/// what a hand-written parser gets wrong, and a fixture cannot catch a change
+/// in the real output format.
+#[test]
+fn the_encoder_check_agrees_with_what_ffmpeg_printed() {
+    let Some(tools) = tools() else {
+        eprintln!("skipping: no ffmpeg available");
+        return;
+    };
+
+    let listing = Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-encoders"])
+        .output()
+        .expect("a working ffmpeg lists its encoders");
+    let printed = String::from_utf8_lossy(&listing.stdout);
+
+    let missing = tools.missing_encoders().expect("a working ffmpeg answers -encoders");
+
+    for codec in VideoCodec::ALL {
+        let encoder = codec.ffmpeg_encoder();
+        // The name column, standing alone — which is what "has this encoder"
+        // means, as distinct from being named in another encoder's description.
+        let present = printed
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .any(|name| name == encoder);
+
+        assert_eq!(
+            !present,
+            missing.contains(&encoder),
+            "{encoder} is {}listed, so it must {}be reported missing",
+            if present { "" } else { "not " },
+            if present { "not " } else { "" }
+        );
     }
 }
 

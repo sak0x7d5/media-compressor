@@ -4,7 +4,8 @@ use crate::clipboard;
 use crate::ffmpeg::acquire::{self, AcquireProgress};
 use crate::ffmpeg::encode::Speed;
 use crate::ffmpeg::probe::probe;
-use crate::ffmpeg::tools::FfmpegTools;
+use crate::ffmpeg::system::{self, SystemBuild};
+use crate::ffmpeg::tools::{FfmpegTools, ToolsSource};
 use crate::images::{is_image, ImageFormat};
 use crate::presets::{self, PresetFile};
 use crate::preview::{self, PreviewPair};
@@ -55,7 +56,14 @@ impl AppState {
             .unwrap_or_else(|_| std::env::temp_dir())
             .join("work");
 
-        let tools = Arc::new(Mutex::new(FfmpegTools::locate(&cache_dir).ok()));
+        // Includes adopting a build already on the machine, which costs one
+        // `ffmpeg -encoders` the first time and nothing on later launches —
+        // see `ffmpeg::system`. When the app has its own copy, which is the
+        // common case, this is filesystem checks and nothing more.
+        let tools = Arc::new(Mutex::new(crate::ffmpeg::resolve(&cache_dir)));
+        // Its own mark: this is the one step here that can spawn a process, and
+        // a startup that went slow should say where rather than be guessed at.
+        crate::trace::mark("setup: ffmpeg resolved");
 
         let emitter = app.clone();
         let queue = Queue::start(
@@ -84,15 +92,18 @@ impl AppState {
     }
 }
 
-/// Whether FFmpeg is here, and where.
+/// Whether FFmpeg is here, where, and whose it is.
 ///
 /// Deliberately says nothing about *which* build it is: answering that means
 /// running `ffmpeg -version`, and this is the first thing startup asks for.
-/// See [`ffmpeg_version`].
+/// See [`ffmpeg_version`]. The source is free — it was decided when the
+/// binaries were found — and it is the difference between "FFmpeg installed"
+/// and being able to tell someone which FFmpeg is doing the work.
 #[derive(Debug, Clone, Serialize)]
 pub struct FfmpegStatus {
     pub installed: bool,
     pub location: Option<String>,
+    pub source: Option<ToolsSource>,
 }
 
 impl FfmpegStatus {
@@ -101,8 +112,9 @@ impl FfmpegStatus {
             Some(tools) => Self {
                 installed: true,
                 location: Some(tools.ffmpeg.to_string_lossy().to_string()),
+                source: Some(tools.source),
             },
-            None => Self { installed: false, location: None },
+            None => Self { installed: false, location: None, source: None },
         }
     }
 }
@@ -303,11 +315,15 @@ pub async fn ffmpeg_version(app: AppHandle) -> Option<String> {
     Some(resolved)
 }
 
-/// Download FFmpeg if it isn't already present.
+/// Download the app's own copy of FFmpeg.
+///
+/// `force` is the difference between the first-run button ("I have no FFmpeg,
+/// get me one") and the Settings escape hatch ("I know you found one on my
+/// PATH, I want yours anyway"). Without it, an existing copy is left alone.
 ///
 /// Runs off the UI thread; progress arrives on the `ffmpeg-install` channel.
 #[tauri::command]
-pub async fn install_ffmpeg(app: AppHandle) -> Result<FfmpegStatus, String> {
+pub async fn install_ffmpeg(app: AppHandle, force: bool) -> Result<FfmpegStatus, String> {
     let state = app.state::<AppState>();
     let cache_dir = state.cache_dir.clone();
     let tools_slot = Arc::clone(&state.tools);
@@ -315,22 +331,92 @@ pub async fn install_ffmpeg(app: AppHandle) -> Result<FfmpegStatus, String> {
 
     let emitter = app.clone();
     let installed = tauri::async_runtime::spawn_blocking(move || {
-        acquire::ensure(&cache_dir, move |progress: AcquireProgress| {
+        let report = move |progress: AcquireProgress| {
             let _ = emitter.emit(EVENT_INSTALL, progress);
-        })
+        };
+        if force {
+            acquire::install(&cache_dir, report)
+        } else {
+            acquire::ensure(&cache_dir, report)
+        }
     })
     .await
     .map_err(|e| format!("install task failed: {e}"))?
     .map_err(|e| e.to_string())?;
 
-    let location = installed.ffmpeg.to_string_lossy().to_string();
-    *tools_slot.lock().unwrap() = Some(installed);
-    // A different binary is on disk now, so whatever banner was remembered for
-    // the last one no longer describes it. Cleared rather than re-read: only
-    // Settings wants the string, and it will ask when it is opened.
-    *version_slot.lock().unwrap() = None;
+    Ok(adopt_tools(installed, &tools_slot, &version_slot))
+}
 
-    Ok(FfmpegStatus { installed: true, location: Some(location) })
+/// Switch to the FFmpeg already on the machine, and delete the app's own copy.
+///
+/// The counterpart to `install_ffmpeg(force: true)`, and the only way to get
+/// those eighty megabytes back once they have been spent.
+#[tauri::command]
+pub async fn use_system_ffmpeg(app: AppHandle) -> Result<FfmpegStatus, String> {
+    let (cache_dir, tools_slot, version_slot) = {
+        let state = app.state::<AppState>();
+        // Deleting the binary a running encode is executing would kill the job
+        // and leave a half-written file behind. This is a check, not a lock — a
+        // file dropped in the millisecond after it passes would still race —
+        // but it covers the case that actually happens, which is switching with
+        // a queue still going.
+        if state.queue.active_count() > 0 {
+            return Err("Finish or cancel the queue first — a job is using FFmpeg right now."
+                .to_string());
+        }
+        (
+            state.cache_dir.clone(),
+            Arc::clone(&state.tools),
+            Arc::clone(&state.version),
+        )
+    };
+
+    let adopted = tauri::async_runtime::spawn_blocking(move || {
+        // Look before deleting. Ending up with neither copy because the check
+        // ran second would be a convenience feature doing real damage.
+        //
+        // Patient rather than deadlined: the startup deadline exists to protect
+        // a window that isn't on screen yet, and this button is pressed in a
+        // window that plainly is.
+        let found = system::adopt_without_deadline(&cache_dir)
+            .ok_or_else(|| "No usable FFmpeg found on your PATH.".to_string())?;
+        found.verify().map_err(|e| e.to_string())?;
+
+        acquire::remove_private_copy(&cache_dir)
+            .map_err(|e| format!("could not remove the downloaded copy: {e}"))?;
+        Ok::<FfmpegTools, String>(found)
+    })
+    .await
+    .map_err(|e| format!("switch task failed: {e}"))??;
+
+    Ok(adopt_tools(adopted, &tools_slot, &version_slot))
+}
+
+/// Put a newly chosen pair into play and report it.
+///
+/// A different binary is in use now, so whatever version banner was remembered
+/// for the last one no longer describes it. Cleared rather than re-read: only
+/// Settings wants the string, and it will ask when it is next opened.
+fn adopt_tools(
+    tools: FfmpegTools,
+    tools_slot: &Arc<Mutex<Option<FfmpegTools>>>,
+    version_slot: &Arc<Mutex<Option<String>>>,
+) -> FfmpegStatus {
+    let status = FfmpegStatus::of(Some(&tools));
+    *tools_slot.lock().unwrap() = Some(tools);
+    *version_slot.lock().unwrap() = None;
+    status
+}
+
+/// The FFmpeg already on the user's PATH, and whether it is good enough.
+///
+/// Like [`ffmpeg_version`], this costs a process the first time it is asked
+/// and nothing afterwards, so only Settings asks and nothing on the startup
+/// path does. Returns `None` when PATH has no FFmpeg at all.
+#[tauri::command]
+pub async fn system_ffmpeg(app: AppHandle) -> Option<SystemBuild> {
+    let cache_dir = app.state::<AppState>().cache_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || system::inspect(&cache_dir)).await.ok()?
 }
 
 #[tauri::command]

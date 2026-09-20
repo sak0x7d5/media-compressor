@@ -62,6 +62,13 @@ pub enum VideoCodec {
 }
 
 impl VideoCodec {
+    /// Every codec the app can be asked for.
+    ///
+    /// Listed so that "which encoders must a usable FFmpeg build have?" has a
+    /// single answer that cannot drift from this enum — see
+    /// [`crate::ffmpeg::tools::FfmpegTools::missing_encoders`].
+    pub const ALL: [Self; 3] = [Self::H264, Self::Hevc, Self::Av1];
+
     /// Bits per pixel below which this codec visibly falls apart.
     ///
     /// Measured as `bitrate / (width * height * fps)`. The H.264 number is the

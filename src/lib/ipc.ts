@@ -24,9 +24,21 @@ export interface PresetFile {
 	last_refreshed?: number | null;
 }
 
+/** Where the binaries in use came from. */
+export type FfmpegSource = 'private' | 'override' | 'system';
+
 export interface FfmpegStatus {
 	installed: boolean;
 	location: string | null;
+	source: FfmpegSource | null;
+}
+
+/** An FFmpeg already on the user's PATH, and whether it is good enough. */
+export interface SystemBuild {
+	location: string;
+	usable: boolean;
+	/** Encoders this app needs that the build does not have. */
+	missing_encoders: string[];
 }
 
 /** Everything the first frame needs, fetched in one round trip. */
@@ -199,7 +211,20 @@ export const savePresets = (presets: PresetFile) => invoke<void>('save_presets',
 export const ffmpegStatus = () => invoke<FfmpegStatus>('ffmpeg_status');
 /** Runs `ffmpeg -version`, so it is asked for lazily rather than at startup. */
 export const ffmpegVersion = () => invoke<string | null>('ffmpeg_version');
-export const installFfmpeg = () => invoke<FfmpegStatus>('install_ffmpeg');
+/**
+ * Download the app's own copy.
+ *
+ * `force` is the Settings escape hatch — "I know you found one on my PATH, I
+ * want yours anyway". Left off, an existing copy is reused rather than
+ * re-fetched.
+ */
+export const installFfmpeg = (force = false) => invoke<FfmpegStatus>('install_ffmpeg', { force });
+
+/** Switch to the FFmpeg already on the machine, deleting the downloaded copy. */
+export const useSystemFfmpeg = () => invoke<FfmpegStatus>('use_system_ffmpeg');
+
+/** Costs a process the first time it is asked, so only Settings asks. */
+export const systemFfmpeg = () => invoke<SystemBuild | null>('system_ffmpeg');
 export const probeFile = (path: string) => invoke<MediaInfo>('probe_file', { path });
 export const addFiles = (paths: string[], settings: EncodeSettings) =>
 	invoke<QueuedFile[]>('add_files', { paths, settings });

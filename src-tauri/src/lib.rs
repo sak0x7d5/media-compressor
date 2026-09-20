@@ -151,6 +151,8 @@ pub fn run() {
             commands::ffmpeg_status,
             commands::ffmpeg_version,
             commands::install_ffmpeg,
+            commands::use_system_ffmpeg,
+            commands::system_ffmpeg,
             commands::probe_file,
             commands::add_files,
             commands::cancel_job,

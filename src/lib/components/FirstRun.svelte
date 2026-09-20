@@ -1,12 +1,15 @@
 <script lang="ts">
-	import type { InstallProgress } from '$lib/ipc';
+	import type { InstallProgress, SystemBuild } from '$lib/ipc';
 	import { formatBytes } from '$lib/format';
 
-	let { progress, error, busy, onInstall }: {
+	let { progress, error, busy, system, onInstall, onUseSystem }: {
 		progress: InstallProgress | null;
 		error: string | null;
 		busy: boolean;
+		/** What's on PATH, if anything. Null once nothing was found there. */
+		system: SystemBuild | null;
 		onInstall: () => void;
+		onUseSystem: () => void;
 	} = $props();
 
 	const fraction = $derived(
@@ -40,6 +43,30 @@
 		touched.
 	</p>
 
+	<!--
+		A usable build here means startup stopped waiting on it rather than that
+		it was turned down — see PROBE_TIMEOUT. Offering it beats making someone
+		download eighty megabytes they demonstrably do not need.
+	-->
+	{#if system?.usable}
+		<p class="found">
+			You already have FFmpeg at <span class="mono">{system.location}</span>, and it can do
+			everything this app needs.
+		</p>
+	{/if}
+
+	<!--
+		Someone who knows they already have FFmpeg deserves to be told why it
+		isn't being used, rather than left to conclude the app never looked.
+	-->
+	{#if system && !system.usable}
+		<p class="found">
+			You do have FFmpeg at <span class="mono">{system.location}</span>, but it was built
+			without {system.missing_encoders.join(' and ')} — which this app needs. The download
+			below is a build that has everything.
+		</p>
+	{/if}
+
 	{#if error}
 		<p class="error">{error}</p>
 	{/if}
@@ -54,9 +81,16 @@
 		</div>
 		<p class="status">{label}</p>
 	{:else}
-		<button class="primary" onclick={onInstall}>
-			{error ? 'Try again' : 'Download FFmpeg'}
-		</button>
+		<div class="actions">
+			{#if system?.usable}
+				<button class="primary" onclick={onUseSystem}>Use the one I have</button>
+				<button class="secondary" onclick={onInstall}>Download a copy anyway</button>
+			{:else}
+				<button class="primary" onclick={onInstall}>
+					{error ? 'Try again' : 'Download FFmpeg'}
+				</button>
+			{/if}
+		</div>
 	{/if}
 </div>
 
@@ -87,6 +121,16 @@
 
 	.error {
 		color: var(--danger);
+	}
+
+	.found {
+		font-size: 12px;
+		color: var(--text-muted);
+	}
+
+	.mono {
+		font-family: var(--font-mono);
+		word-break: break-all;
 	}
 
 	.track {
@@ -138,5 +182,25 @@
 
 	button.primary:hover {
 		filter: brightness(1.1);
+	}
+
+	.actions {
+		display: flex;
+		gap: 8px;
+		align-items: center;
+	}
+
+	button.secondary {
+		background: none;
+		border: 1px solid var(--border);
+		color: var(--text-secondary);
+		border-radius: 6px;
+		padding: 7px 15px;
+		font-size: 13px;
+	}
+
+	button.secondary:hover {
+		color: var(--text);
+		background: var(--bg-row-hover);
 	}
 </style>
