@@ -1,33 +1,52 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import type { EncodeSettings, FfmpegStatus, OutputMode, PresetFile } from '$lib/ipc';
 	import { confirm, open } from '@tauri-apps/plugin-dialog';
-	import { checkForUpdate, installUpdate, setPresetsUrl, setShellMenu } from '$lib/ipc';
+	import {
+		checkForUpdate,
+		ffmpegVersion,
+		installUpdate,
+		setPresetsUrl,
+		setShellMenu,
+		shellMenuStatus
+	} from '$lib/ipc';
 
 	let {
 		settings,
 		status,
-		shellMenu,
 		presetsSourceUrl,
 		outputMode,
 		outputDir,
 		onChange,
-		onShellMenu,
 		onPresets,
 		onOutput,
 		onClose
 	}: {
 		settings: EncodeSettings;
 		status: FfmpegStatus | null;
-		shellMenu: boolean;
 		presetsSourceUrl: string;
 		outputMode: OutputMode;
 		outputDir: string | null;
 		onChange: (patch: Partial<EncodeSettings>) => void;
-		onShellMenu: (enabled: boolean) => void;
 		onPresets: (presets: PresetFile) => void;
 		onOutput: (mode: OutputMode, dir: string | null) => void;
 		onClose: () => void;
 	} = $props();
+
+	/* Both of these cost real work to answer — a registry read and an
+	   `ffmpeg -version` process — and neither is worth anything until this
+	   panel is open, so they are asked for here rather than at startup. */
+	let shellMenu = $state(false);
+	let version = $state<string | null>(null);
+
+	onMount(() => {
+		void (async () => {
+			shellMenu = await shellMenuStatus();
+		})();
+		void (async () => {
+			version = await ffmpegVersion();
+		})();
+	});
 
 	/**
 	 * Just the folder name, so a deep path does not blow out the row. Splits on
@@ -49,12 +68,12 @@
 	 *
 	 * The setting sticks, so this is the last point at which anyone is thinking
 	 * about it — every drop after this silently consumes its original. Nothing
-	 * else in the app deletes a file the user already had.
+	 * else in the app touches a file the user already had.
 	 */
 	async function chooseMode(mode: OutputMode) {
 		if (mode === 'replace' && outputMode !== 'replace') {
 			const agreed = await confirm(
-				'Compressed files will take the place of the originals, and the originals will be deleted. This cannot be undone.',
+				'Compressed files will take the place of the originals, and the originals will go to the recycle bin.',
 				{ title: 'Replace originals?', kind: 'warning', okLabel: 'Replace originals' }
 			);
 			if (!agreed) return;
@@ -134,7 +153,7 @@
 		shellBusy = true;
 		shellError = null;
 		try {
-			onShellMenu(await setShellMenu(enabled));
+			shellMenu = await setShellMenu(enabled);
 		} catch (error) {
 			shellError = String(error);
 		} finally {
@@ -178,10 +197,10 @@
 	{/if}
 	{#if outputMode === 'replace'}
 		<p class="warn">
-			Each original is deleted once its compressed version is written in its place. The
-			compression is lossy and the original is not recoverable, so keep anything you cannot
-			re-download backed up elsewhere. A result that comes out no smaller than its source is
-			discarded instead, leaving that file alone.
+			Each original goes to the recycle bin once its compressed version is written in its
+			place. The compression is lossy, so the bin is the only way back to the file you had —
+			empty it and the original is gone. A result that comes out no smaller than its source
+			is discarded instead, leaving that file alone.
 		</p>
 	{:else if outputMode !== 'beside'}
 		<p class="hint">
@@ -323,7 +342,9 @@
 	{/if}
 
 	<div class="foot">
-		<span class="mono">{status?.version ?? 'FFmpeg not installed'}</span>
+		<span class="mono">
+			{version ?? (status?.installed ? 'FFmpeg installed' : 'FFmpeg not installed')}
+		</span>
 	</div>
 </div>
 
