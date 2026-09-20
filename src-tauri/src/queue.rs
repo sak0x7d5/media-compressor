@@ -206,6 +206,17 @@ impl Queue {
     pub fn pending_count(&self) -> usize {
         self.shared.pending.lock().unwrap().len()
     }
+
+    /// Jobs either running or waiting to run.
+    ///
+    /// [`Self::pending_count`] answers a narrower question: it does not count
+    /// the job the worker is inside right now, which is precisely the one that
+    /// would notice its `ffmpeg` being deleted out from under it. A token
+    /// exists from the moment a job is pushed until the moment it finishes, so
+    /// counting those is the honest answer to "is anything using FFmpeg?"
+    pub fn active_count(&self) -> usize {
+        self.shared.tokens.lock().unwrap().len()
+    }
 }
 
 impl Drop for Queue {

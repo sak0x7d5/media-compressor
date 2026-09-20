@@ -21,17 +21,25 @@
 //! That is a weaker guarantee than the plan implied, and it is stated plainly
 //! rather than dressed up.
 
-use super::tools::FfmpegTools;
+use super::tools::{exe, FfmpegTools};
 use ffmpeg_sidecar::download::{
     download_ffmpeg_package_with_progress, ffmpeg_download_url, unpack_ffmpeg,
     FfmpegDownloadProgressEvent,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const MANIFEST: &str = "install.json";
+
+/// The shortest gap between two download progress events.
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The smallest share of the archive worth interrupting the UI for.
+const PROGRESS_MIN_FRACTION: f64 = 0.01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(tag = "step", rename_all = "kebab-case")]
@@ -96,6 +104,56 @@ fn now_iso8601() -> String {
     }
 }
 
+/// Whether a download progress update has earned its trip to the UI.
+///
+/// The underlying reader reports every single `read()`, and `io::copy` reads in
+/// 8 KiB chunks — so an 80 MB archive produces something like ten thousand
+/// callbacks, each of which would be serialized and pushed across the IPC
+/// bridge into the webview. That is enough work to measurably slow down the
+/// download it is reporting on, to say nothing of what it does to the frame the
+/// progress bar is drawn in.
+///
+/// A quarter second or a percent of the archive, whichever comes first, is
+/// still far finer than a person can see.
+fn worth_emitting(
+    since_last: Duration,
+    bytes_since_last: u64,
+    total_bytes: u64,
+    finished: bool,
+) -> bool {
+    // The last update is the one that says 100%, so it always goes out.
+    finished
+        || since_last >= PROGRESS_MIN_INTERVAL
+        || (total_bytes > 0
+            && bytes_since_last as f64 >= total_bytes as f64 * PROGRESS_MIN_FRACTION)
+}
+
+/// Keeps the "when did we last say something" state for [`worth_emitting`].
+struct ProgressGate {
+    last_at: Cell<Instant>,
+    last_bytes: Cell<u64>,
+}
+
+impl ProgressGate {
+    fn new() -> Self {
+        Self { last_at: Cell::new(Instant::now()), last_bytes: Cell::new(0) }
+    }
+
+    fn admits(&self, downloaded_bytes: u64, total_bytes: u64) -> bool {
+        let finished = total_bytes > 0 && downloaded_bytes >= total_bytes;
+        let since_last = self.last_at.get().elapsed();
+        let bytes_since_last = downloaded_bytes.saturating_sub(self.last_bytes.get());
+
+        if !worth_emitting(since_last, bytes_since_last, total_bytes, finished) {
+            return false;
+        }
+
+        self.last_at.set(Instant::now());
+        self.last_bytes.set(downloaded_bytes);
+        true
+    }
+}
+
 pub fn manifest_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(MANIFEST)
 }
@@ -115,9 +173,12 @@ pub fn install(
 
     let url = ffmpeg_download_url().map_err(|e| AcquireError::UnsupportedPlatform(e.to_string()))?;
 
+    let gate = ProgressGate::new();
     let archive = download_ffmpeg_package_with_progress(url, cache_dir, |event| match event {
         FfmpegDownloadProgressEvent::Downloading { total_bytes, downloaded_bytes } => {
-            on_progress(AcquireProgress::Downloading { downloaded_bytes, total_bytes });
+            if gate.admits(downloaded_bytes, total_bytes) {
+                on_progress(AcquireProgress::Downloading { downloaded_bytes, total_bytes });
+            }
         }
         FfmpegDownloadProgressEvent::UnpackingArchive => on_progress(AcquireProgress::Unpacking),
         FfmpegDownloadProgressEvent::Starting => on_progress(AcquireProgress::Starting),
@@ -131,6 +192,11 @@ pub fn install(
     unpack_ffmpeg(&archive, cache_dir).map_err(|e| AcquireError::Unpack(e.to_string()))?;
     // The archive is tens of megabytes and has served its purpose.
     let _ = std::fs::remove_file(&archive);
+    // So has ffplay, which the archive carries and this app never launches. It
+    // is another ninety megabytes of someone's disk for a media player they
+    // did not ask for. (It cannot be skipped at download time — the archive is
+    // one file — but it does not have to be kept.)
+    let _ = std::fs::remove_file(cache_dir.join(exe("ffplay")));
 
     on_progress(AcquireProgress::Verifying);
     let tools = FfmpegTools::in_cache(cache_dir);
@@ -150,6 +216,24 @@ pub fn install(
 
     on_progress(AcquireProgress::Done);
     Ok(tools)
+}
+
+/// Delete the app's own copy of FFmpeg, and the record of it.
+///
+/// The counterpart to [`install`]: it exists so that someone who has already
+/// paid for the download can hand those megabytes back once they find out the
+/// app will happily use the FFmpeg they already had.
+pub fn remove_private_copy(cache_dir: &Path) -> std::io::Result<()> {
+    for name in ["ffmpeg", "ffprobe", "ffplay"] {
+        match std::fs::remove_file(cache_dir.join(exe(name))) {
+            Ok(()) => {}
+            // Already gone is the state we were asking for.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let _ = std::fs::remove_file(manifest_path(cache_dir));
+    Ok(())
 }
 
 /// Return a working install, downloading one only if there isn't one already.
@@ -197,5 +281,73 @@ mod tests {
     #[test]
     fn a_missing_manifest_is_absent_rather_than_an_error() {
         assert!(read_manifest(Path::new("nowhere-at-all")).is_none());
+    }
+
+    /// Divides into whole percents, so "one percent" in these tests is the
+    /// exact threshold rather than a byte under it.
+    const ARCHIVE: u64 = 100_000_000;
+    const ONE_PERCENT: u64 = ARCHIVE / 100;
+
+    #[test]
+    fn a_trickle_of_bytes_does_not_become_a_flood_of_events() {
+        assert!(
+            !worth_emitting(Duration::from_millis(1), 8 * 1024, ARCHIVE, false),
+            "one 8 KiB read out of a hundred megabytes is not news"
+        );
+    }
+
+    #[test]
+    fn progress_still_gets_through_on_either_rule() {
+        assert!(
+            worth_emitting(Duration::from_millis(300), 8 * 1024, ARCHIVE, false),
+            "a quarter second of silence is long enough to say something"
+        );
+        assert!(
+            worth_emitting(Duration::ZERO, ONE_PERCENT, ARCHIVE, false),
+            "a percent of the archive is worth an update however fast it arrived"
+        );
+    }
+
+    /// A progress bar that stops at 99% reads as a hang.
+    #[test]
+    fn the_final_update_is_never_withheld() {
+        assert!(worth_emitting(Duration::ZERO, 1, ARCHIVE, true));
+    }
+
+    /// Without a Content-Length there is no percentage to measure against, so
+    /// the clock has to carry it alone.
+    #[test]
+    fn an_unknown_total_falls_back_to_the_clock() {
+        assert!(!worth_emitting(Duration::from_millis(1), 1024 * 1024, 0, false));
+        assert!(worth_emitting(Duration::from_millis(300), 0, 0, false));
+    }
+
+    #[test]
+    fn the_gate_lets_the_first_update_through_then_holds_the_line() {
+        let gate = ProgressGate::new();
+
+        assert!(gate.admits(ONE_PERCENT, ARCHIVE), "the first percent is an update");
+        assert!(!gate.admits(ONE_PERCENT + 8 * 1024, ARCHIVE), "8 KiB later is not");
+        assert!(gate.admits(ARCHIVE, ARCHIVE), "the end always reports");
+    }
+
+    #[test]
+    fn removing_a_copy_that_is_not_there_is_not_an_error() {
+        let dir = std::env::temp_dir()
+            .join("media-compressor-tests")
+            .join(format!("remove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(remove_private_copy(&dir).is_ok(), "an empty folder is already the goal");
+
+        std::fs::write(dir.join(super::exe("ffmpeg")), b"x").unwrap();
+        std::fs::write(dir.join(super::exe("ffprobe")), b"x").unwrap();
+        remove_private_copy(&dir).unwrap();
+
+        assert!(!dir.join(super::exe("ffmpeg")).exists());
+        assert!(!dir.join(super::exe("ffprobe")).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

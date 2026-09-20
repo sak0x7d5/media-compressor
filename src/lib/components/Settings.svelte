@@ -1,15 +1,27 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import type { EncodeSettings, FfmpegStatus, OutputMode, PresetFile } from '$lib/ipc';
+	import type {
+		EncodeSettings,
+		FfmpegStatus,
+		InstallProgress,
+		OutputMode,
+		PresetFile,
+		SystemBuild
+	} from '$lib/ipc';
 	import { confirm, open } from '@tauri-apps/plugin-dialog';
 	import {
 		checkForUpdate,
 		ffmpegVersion,
+		installFfmpeg,
 		installUpdate,
+		onInstallProgress,
 		setPresetsUrl,
 		setShellMenu,
-		shellMenuStatus
+		shellMenuStatus,
+		systemFfmpeg,
+		useSystemFfmpeg
 	} from '$lib/ipc';
+	import { formatBytes } from '$lib/format';
 
 	let {
 		settings,
@@ -20,6 +32,7 @@
 		onChange,
 		onPresets,
 		onOutput,
+		onFfmpeg,
 		onClose
 	}: {
 		settings: EncodeSettings;
@@ -30,6 +43,7 @@
 		onChange: (patch: Partial<EncodeSettings>) => void;
 		onPresets: (presets: PresetFile) => void;
 		onOutput: (mode: OutputMode, dir: string | null) => void;
+		onFfmpeg: (status: FfmpegStatus) => void;
 		onClose: () => void;
 	} = $props();
 
@@ -38,6 +52,13 @@
 	   panel is open, so they are asked for here rather than at startup. */
 	let shellMenu = $state(false);
 	let version = $state<string | null>(null);
+	/* What is on PATH, which costs an `ffmpeg -encoders` the first time it is
+	   asked and nothing afterwards. Null means PATH has no FFmpeg at all. */
+	let system = $state<SystemBuild | null>(null);
+
+	let ffmpegBusy = $state<'downloading' | 'switching' | null>(null);
+	let ffmpegError = $state<string | null>(null);
+	let ffmpegProgress = $state<InstallProgress | null>(null);
 
 	onMount(() => {
 		void (async () => {
@@ -46,7 +67,58 @@
 		void (async () => {
 			version = await ffmpegVersion();
 		})();
+		void (async () => {
+			system = await systemFfmpeg();
+		})();
+
+		/* A download started from here is the same 80 MB as the one on the
+		   first-run screen, so it reports the same way rather than leaving a
+		   dead button for a minute. */
+		const pending = onInstallProgress((event) => {
+			ffmpegProgress = event;
+		});
+		return () => void pending.then((unlisten) => unlisten());
 	});
+
+	const sourceLabel = $derived.by(() => {
+		switch (status?.source) {
+			case 'system':
+				return 'Yours, already installed';
+			case 'override':
+				return 'Set by MEDIA_COMPRESSOR_FFMPEG';
+			case 'private':
+				return "This app's own copy";
+			default:
+				return 'Not installed';
+		}
+	});
+
+	const downloadLabel = $derived.by(() => {
+		if (ffmpegProgress?.step === 'downloading' && ffmpegProgress.total_bytes > 0) {
+			return `${formatBytes(ffmpegProgress.downloaded_bytes)} of ${formatBytes(ffmpegProgress.total_bytes)}`;
+		}
+		if (ffmpegProgress?.step === 'unpacking') return 'Unpacking…';
+		if (ffmpegProgress?.step === 'verifying') return 'Checking…';
+		return 'Downloading…';
+	});
+
+	async function withFfmpeg(what: 'downloading' | 'switching', action: () => Promise<FfmpegStatus>) {
+		ffmpegBusy = what;
+		ffmpegError = null;
+		try {
+			onFfmpeg(await action());
+			/* Both paths put a different binary in play, so the banner and the
+			   verdict about PATH are both re-read rather than left describing
+			   the previous one. */
+			version = await ffmpegVersion();
+			system = await systemFfmpeg();
+		} catch (error) {
+			ffmpegError = String(error);
+		} finally {
+			ffmpegBusy = null;
+			ffmpegProgress = null;
+		}
+	}
 
 	/**
 	 * Just the folder name, so a deep path does not blow out the row. Splits on
@@ -312,6 +384,50 @@
 	</p>
 	{#if urlError}
 		<p class="warn">{urlError}</p>
+	{/if}
+
+	<div class="row">
+		<span class="name">FFmpeg</span>
+		{#if status?.source === 'system'}
+			<button
+				class="toggle"
+				disabled={ffmpegBusy !== null}
+				onclick={() => withFfmpeg('downloading', () => installFfmpeg(true))}
+			>
+				{ffmpegBusy === 'downloading' ? downloadLabel : 'Download a private copy'}
+			</button>
+		{:else if status?.source === 'private' && system?.usable}
+			<button
+				class="toggle"
+				disabled={ffmpegBusy !== null}
+				onclick={() => withFfmpeg('switching', useSystemFfmpeg)}
+			>
+				{ffmpegBusy === 'switching' ? 'Switching…' : 'Use the one you have'}
+			</button>
+		{:else}
+			<span class="value">{sourceLabel}</span>
+		{/if}
+	</div>
+	{#if status?.source === 'system'}
+		<p class="hint">
+			Using the FFmpeg already on your PATH — no download was needed. Downloading a private
+			copy is worth it only if you expect to change or remove that install.
+		</p>
+	{:else if status?.source === 'private' && system?.usable}
+		<p class="hint">
+			You already have an FFmpeg that can do everything this app asks for. Switching to it
+			frees the copy this app downloaded.
+		</p>
+	{:else if status?.source === 'private' && system && !system.usable}
+		<p class="hint">
+			There's an FFmpeg on your PATH, but it was built without
+			{system.missing_encoders.join(' and ')}, so this app keeps its own copy.
+		</p>
+	{:else if status?.source === 'override'}
+		<p class="hint">Pointed at a specific build by MEDIA_COMPRESSOR_FFMPEG.</p>
+	{/if}
+	{#if ffmpegError}
+		<p class="warn">{ffmpegError}</p>
 	{/if}
 
 	<div class="row">

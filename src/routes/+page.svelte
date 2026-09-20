@@ -26,13 +26,16 @@
 		previewPair,
 		revealInFolder,
 		startup,
+		systemFfmpeg,
+		useSystemFfmpeg,
 		uiReady,
 		type EncodeSettings,
 		type FfmpegStatus,
 		type InstallProgress,
 		type OutputMode,
 		type PresetFile,
-		type PreviewPair
+		type PreviewPair,
+		type SystemBuild
 	} from '$lib/ipc';
 
 	const CUSTOM = '__custom__';
@@ -47,6 +50,10 @@
 	const jobs = new JobList();
 
 	let status = $state<FfmpegStatus | null>(null);
+	/* Only consulted when there is nothing installed, to explain why an FFmpeg
+	   the user can see on their PATH is not the one about to be used. The
+	   backend decided this at startup and cached it, so asking is free. */
+	let systemBuild = $state<SystemBuild | null>(null);
 	let presets = $state<PresetFile | null>(null);
 	let selectedId = $state('');
 	let customBytes = $state(20_000_000);
@@ -175,6 +182,19 @@
 		}
 	}
 
+	/** Offered only when startup found a usable build but stopped waiting on it. */
+	async function adoptSystem() {
+		installing = true;
+		installError = null;
+		try {
+			status = await useSystemFfmpeg();
+		} catch (error) {
+			installError = String(error);
+		} finally {
+			installing = false;
+		}
+	}
+
 	async function copy(path: string) {
 		try {
 			await copyToClipboard([path]);
@@ -235,6 +255,16 @@
 			void uiReady();
 		}
 
+		// After the reveal: the first-run screen is worth a sentence about the
+		// FFmpeg already on the machine, but not a delay before the window.
+		if (status && !status.installed) {
+			try {
+				systemBuild = await systemFfmpeg();
+			} catch {
+				// Nothing to say about PATH is the same as having nothing to say.
+			}
+		}
+
 		// Files handed to us on the command line — the Explorer context menu
 		// path for a cold start. Queued after the reveal so a folder prompt has
 		// a window to sit in front of.
@@ -279,7 +309,9 @@
 			progress={installProgress}
 			error={installError}
 			busy={installing}
+			system={systemBuild}
 			onInstall={install}
+			onUseSystem={adoptSystem}
 		/>
 	{:else}
 		<header>
@@ -326,6 +358,7 @@
 					}}
 					onChange={(patch) => (options = { ...options, ...patch })}
 					onPresets={(next) => (presets = next)}
+					onFfmpeg={(next) => (status = next)}
 					onClose={() => (showSettings = false)}
 				/>
 			{:else if preview}
