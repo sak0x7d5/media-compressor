@@ -459,10 +459,7 @@
 	{#if update.kind === 'current'}
 		<p class="hint">You're on the newest version.</p>
 	{:else if update.kind === 'failed'}
-		<p class="hint">
-			Couldn't reach the update server. That's expected while the project repository is
-			private — no releases are published yet.
-		</p>
+		<p class="warn">{update.message}</p>
 	{/if}
 
 	<div class="foot">

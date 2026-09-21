@@ -1,10 +1,12 @@
-# Builds, signs and publishes a release when a version tag is pushed.
+# Builds, signs and drafts a release when a version tag is pushed.
 #
 #     git tag v0.2.0 && git push origin v0.2.0
 #
-# That is the whole release process. The workflow produces the installer and a
-# `latest.json` describing it, which is the file installed copies of the app
-# check to discover that a newer version exists.
+# Then publish the draft from the Releases page; that is the whole release
+# process. The workflow produces the installer and a `latest.json` describing
+# it, which is the file installed copies of the app check to discover that a
+# newer version exists. GitHub serves nothing from a draft, so nobody's app
+# sees the release until it is published.
 #
 # Before the first release, two things must be true:
 #

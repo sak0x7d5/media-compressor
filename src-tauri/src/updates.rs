@@ -6,13 +6,14 @@
 //! key is compiled into the binary, so a compromised download host cannot push
 //! anything the app will accept.
 //!
-//! ## Dormant until releases exist
+//! ## Where releases come from
 //!
-//! The endpoint points at GitHub releases for a repository that is currently
-//! private, so the check simply finds nothing. That is deliberate and harmless:
-//! the capability has to be inside the build people already have, or it can
-//! never reach them. Making the repository public is the only step left to turn
-//! this on — no code change.
+//! The endpoint is the `latest.json` attached to the newest *published* GitHub
+//! release. The release workflow creates every release as a draft, and GitHub
+//! serves nothing from a draft, so until someone publishes it the check comes
+//! back empty-handed and says so. That is the whole reason the updater ships
+//! before there is anything to update to: the capability has to be inside the
+//! build people already have, or a newer version can never reach them.
 
 use serde::Serialize;
 use std::time::Duration;
@@ -47,8 +48,38 @@ pub async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>, Stri
             date: update.date.map(|date| date.to_string()),
         })),
         Ok(None) => Ok(None),
-        Err(error) => Err(format!("could not check for updates: {error}")),
+        Err(error) => Err(describe(&error)),
     }
+}
+
+/// Say what went wrong in words the settings panel can show.
+///
+/// The plugin uses the same jargon for "the server answered, but not with a
+/// release" — a 404 because nothing is published yet — as for a request that
+/// never got through, and those call for different reactions. Each message
+/// states only what was observed; why it happened is not something the app
+/// can know, so it does not guess.
+fn describe(error: &tauri_plugin_updater::Error) -> String {
+    use tauri_plugin_updater::Error;
+
+    match error {
+        Error::ReleaseNotFound => "the update server answered, but has no release to offer".into(),
+        Error::Reqwest(e) if e.is_request() => {
+            format!("couldn't reach the update server: {}", root_cause(e))
+        }
+        other => format!("couldn't check for updates: {}", root_cause(other)),
+    }
+}
+
+/// The innermost cause, which is the one that says something useful. `reqwest`
+/// itself only reports "error sending request" and leaves the DNS failure or
+/// timeout at the bottom of the chain.
+fn root_cause(error: &dyn std::error::Error) -> String {
+    let mut cause = error;
+    while let Some(next) = cause.source() {
+        cause = next;
+    }
+    cause.to_string()
 }
 
 /// Download and install the available update, then restart into it.
@@ -63,7 +94,7 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
     let update = updater
         .check()
         .await
-        .map_err(|e| format!("could not check for updates: {e}"))?
+        .map_err(|e| describe(&e))?
         .ok_or_else(|| "there is no update to install".to_string())?;
 
     update
@@ -86,8 +117,8 @@ const STARTUP_DELAY: Duration = Duration::from_secs(5);
 /// Check quietly in the background, shortly after startup.
 ///
 /// Failure is silent by design. Someone compressing a video does not need a
-/// dialog because a release server was unreachable, and while the repository is
-/// private this is expected to find nothing every time.
+/// dialog because a release server was unreachable; the settings panel is where
+/// a failed check gets explained, when someone asks.
 pub fn check_in_background(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -96,4 +127,28 @@ pub fn check_in_background(app: &AppHandle) {
             let _ = updater.check().await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_release_is_not_blamed_on_anything() {
+        let message = describe(&tauri_plugin_updater::Error::ReleaseNotFound);
+        assert_eq!(message, "the update server answered, but has no release to offer");
+    }
+
+    #[test]
+    fn the_root_cause_is_the_innermost_error() {
+        let inner = std::io::Error::new(std::io::ErrorKind::NotFound, "no such host");
+        let outer = std::io::Error::other(inner);
+        assert_eq!(root_cause(&outer), "no such host");
+    }
+
+    #[test]
+    fn an_error_without_a_cause_speaks_for_itself() {
+        let message = describe(&tauri_plugin_updater::Error::UnsupportedOs);
+        assert!(message.starts_with("couldn't check for updates: Unsupported OS"), "{message}");
+    }
 }

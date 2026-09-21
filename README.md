@@ -318,9 +318,12 @@ git commit -am "release v0.2.0"
 git tag v0.2.0 && git push origin main v0.2.0
 ```
 
-That triggers a workflow which builds the installer, signs it, and publishes a
-draft release including a `latest.json` describing the new version. Installed
-copies check that file and offer the update.
+That triggers a workflow which builds the installer, signs it, and creates a
+**draft** release including a `latest.json` describing the new version. The
+draft is where release notes get written; GitHub serves nothing from it until
+it is published from the Releases page. Once it is, installed copies find the
+`latest.json` and offer the update. Until then the in-app check reports that
+the server answered but had no release to offer, which is exactly right.
 
 The tag has to match the version in `tauri.conf.json`, and the workflow stops if
 it doesn't. That version — not the tag — is what `latest.json` advertises, so
@@ -344,8 +347,9 @@ anything signed with a different key.
 The repository also has to be public, so an installed copy can fetch
 `latest.json` without a login — that part is already done.
 
-Until the secret is set, the in-app check simply reports that it could not reach
-the update server, which is accurate and harmless.
+Until a release is published, the in-app check reports that the server answered
+but had no release to offer — the same thing it says while a release is still a
+draft — and Settings shows that message rather than guessing at a cause.
 
 **Update support only works forward.** A copy of the app can only update itself
 if the build the user installed already contained the updater. Anyone running a
