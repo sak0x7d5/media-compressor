@@ -38,10 +38,25 @@ const MENU_KEY: &str = "MediaCompressor.ShrinkMenu";
 const UNINSTALL_HOOK: &str = include_str!("../nsis/hooks.nsh");
 
 /// Extensions that get the menu entry.
+///
+/// Deliberately excludes `.ts`: it is the MPEG transport stream extension, but
+/// it is also TypeScript, and an extension association cannot tell the two
+/// apart. Registering it would put "Compress for Discord" on every source file
+/// on a developer machine, so transport streams have to be added by hand.
 const EXTENSIONS: &[&str] = &[
-    ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg", ".ts",
+    ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg",
     ".gif", ".png", ".jpg", ".jpeg", ".webp", ".avif", ".bmp", ".tif", ".tiff",
 ];
+
+/// Extensions an earlier build registered and this one no longer does.
+///
+/// Dropping one from [`EXTENSIONS`] stops it being written, but a machine that
+/// enabled the menu under the old build still has the key, pointing at this
+/// executable. Nothing else would ever delete it: [`register`] only writes the
+/// current list, and a cleanup that iterates the current list walks straight
+/// past it. So [`unregister`] and the uninstaller take both lists, and only
+/// [`register`] and [`registered_count`] take the first.
+const RETIRED_EXTENSIONS: &[&str] = &[".ts"];
 
 #[derive(Debug, Error)]
 pub enum ShellError {
@@ -166,7 +181,7 @@ mod imp {
         // Absent is the desired end state, so "not found" is success.
         let _ = hkcu.delete_subkey_all(menu_path());
 
-        for extension in EXTENSIONS {
+        for extension in EXTENSIONS.iter().chain(RETIRED_EXTENSIONS) {
             let path = base_path(extension);
             match hkcu.open_subkey_with_flags(&path, KEY_ALL_ACCESS) {
                 Ok(_) => {
@@ -255,6 +270,17 @@ mod tests {
         }
     }
 
+    /// `.ts` is a transport stream and also TypeScript. Claiming it puts the
+    /// menu entry on every source file on a developer's machine, so it stays
+    /// out no matter how video-shaped it looks.
+    #[test]
+    fn typescript_sources_are_not_claimed() {
+        assert!(
+            !EXTENSIONS.contains(&".ts"),
+            ".ts is TypeScript as often as it is a transport stream"
+        );
+    }
+
     /// Registering writes to the user's registry, so it is deliberately not
     /// exercised here — a test suite should not change the machine it runs on.
     /// `is_registered` only reads, so it is safe to call.
@@ -293,8 +319,22 @@ mod tests {
         }
     }
 
-    /// The reverse direction: a line left behind for an extension we no longer
-    /// register is dead weight, and a sign the two lists were edited apart.
+    /// Retired extensions are the other thing an uninstall has to clean up:
+    /// the key an older build wrote is still there, still pointing at us.
+    #[test]
+    fn the_uninstaller_cleans_up_every_extension_we_used_to_register() {
+        for extension in RETIRED_EXTENSIONS {
+            let line = format!("!insertmacro RemoveShrinkVerb \"{extension}\"");
+            assert!(
+                UNINSTALL_HOOK.contains(&line),
+                "nsis/hooks.nsh does not remove retired {extension}; add `{line}`"
+            );
+        }
+    }
+
+    /// The reverse direction: a line left behind for an extension we neither
+    /// register nor used to is dead weight, and a sign the lists were edited
+    /// apart.
     #[test]
     fn the_uninstaller_removes_nothing_we_do_not_register() {
         for line in UNINSTALL_HOOK.lines() {
@@ -304,9 +344,18 @@ mod tests {
             };
             let extension = rest.trim().trim_matches('"');
             assert!(
-                EXTENSIONS.contains(&extension),
-                "nsis/hooks.nsh removes {extension}, which is not in EXTENSIONS"
+                EXTENSIONS.contains(&extension) || RETIRED_EXTENSIONS.contains(&extension),
+                "nsis/hooks.nsh removes {extension}, which is in neither EXTENSIONS nor RETIRED_EXTENSIONS"
             );
+        }
+    }
+
+    /// A retired extension is one we stopped writing, so it must not still be
+    /// on the list we write.
+    #[test]
+    fn a_retired_extension_is_not_also_a_current_one() {
+        for extension in RETIRED_EXTENSIONS {
+            assert!(!EXTENSIONS.contains(extension), "{extension} is both current and retired");
         }
     }
 

@@ -39,7 +39,6 @@
   !insertmacro RemoveShrinkVerb ".flv"
   !insertmacro RemoveShrinkVerb ".mpg"
   !insertmacro RemoveShrinkVerb ".mpeg"
-  !insertmacro RemoveShrinkVerb ".ts"
   !insertmacro RemoveShrinkVerb ".gif"
   !insertmacro RemoveShrinkVerb ".png"
   !insertmacro RemoveShrinkVerb ".jpg"
@@ -49,4 +48,8 @@
   !insertmacro RemoveShrinkVerb ".bmp"
   !insertmacro RemoveShrinkVerb ".tif"
   !insertmacro RemoveShrinkVerb ".tiff"
+  ; Registered by earlier builds and retired since; the key is still there on
+  ; any machine that enabled the menu under one of them. Mirrors
+  ; RETIRED_EXTENSIONS in shell_integration.rs.
+  !insertmacro RemoveShrinkVerb ".ts"
 !macroend

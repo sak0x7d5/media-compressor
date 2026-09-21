@@ -41,9 +41,14 @@
 	} from '$lib/ipc';
 
 	const CUSTOM = '__custom__';
-	/* Must stay in step with EXTENSIONS in shell_integration.rs: anything the
+	/* Must stay a superset of EXTENSIONS in shell_integration.rs: anything the
 	   Explorer menu offers has to be accepted here, or right-clicking a file the
-	   app itself advertised ends in "that file type is not supported". */
+	   app itself advertised ends in "that file type is not supported".
+
+	   It keeps 'ts' even though the Explorer menu drops it: dragging a file in
+	   or picking it from the browse dialog is a deliberate choice about that one
+	   file, so a TypeScript source can never turn up here unasked the way a
+	   registered .ts menu entry turns up on every source file on the machine. */
 	const MEDIA_EXTENSIONS = [
 		'mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v', 'wmv', 'flv', 'mpg', 'mpeg', 'ts', 'gif',
 		'png', 'jpg', 'jpeg', 'webp', 'avif', 'bmp', 'tif', 'tiff'
