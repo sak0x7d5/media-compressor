@@ -261,7 +261,7 @@ fn a_tight_target_forces_two_pass_and_a_downscale() {
 }
 
 #[test]
-fn cancelling_stops_the_encode_and_leaves_no_scratch_files() {
+fn cancelling_stops_the_encode_and_leaves_nothing_behind() {
     let Some(tools) = tools() else {
         eprintln!("skipping: no ffmpeg available");
         return;
@@ -277,19 +277,30 @@ fn cancelling_stops_the_encode_and_leaves_no_scratch_files() {
     let cancel = CancelToken::new();
     let mut seen_progress = 0;
 
-    let result = compress(&tools, &request(&input, &output, &work, 2_000_000), &cancel, |stage| {
-        if matches!(stage, Stage::Encoding(_)) {
-            seen_progress += 1;
-            // Let it get going, then pull the plug.
-            if seen_progress >= 2 {
-                cancel.cancel();
+    // Through the entry point the queue uses: that is the layer which owns
+    // clearing up a destination this run created and did not finish.
+    let result = compress_media(
+        &tools,
+        &request(&input, &output, &work, 2_000_000),
+        &cancel,
+        |stage| {
+            if matches!(stage, Stage::Encoding(_)) {
+                seen_progress += 1;
+                // Let it get going, then pull the plug.
+                if seen_progress >= 2 {
+                    cancel.cancel();
+                }
             }
-        }
-    });
+        },
+    );
 
     let error = result.expect_err("a cancelled job must not report success");
     assert!(error.is_cancellation(), "expected cancellation, got {error}");
     assert!(!work.exists(), "the work directory should be cleaned up on cancel");
+    // The encode had started, so there was a truncated file at the destination.
+    // Leaving it there passes it off as a result and makes the next run pick a
+    // "(compressed 2)" name to avoid it.
+    assert!(!output.exists(), "a cancelled encode should not leave a partial file");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

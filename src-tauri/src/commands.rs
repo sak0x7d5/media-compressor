@@ -11,7 +11,7 @@ use crate::presets::{self, PresetFile};
 use crate::preview::{self, PreviewPair};
 use crate::queue::{
     output_path_for, replacement_path_for, staging_path_for, Disposition, JobEvent, Queue,
-    QueueItem,
+    QueueItem, QueueStatus,
 };
 use crate::shell_integration;
 use crate::strategy::plan::Options;
@@ -441,6 +441,10 @@ pub async fn probe_file(app: AppHandle, path: String) -> Result<MediaInfo, Strin
 }
 
 /// Queue one or more files for compression.
+///
+/// Adding files also sets a paused queue going again. Dropping a file in is an
+/// unambiguous "do this", and a queue that accepted it and then sat on it would
+/// look broken — the pause was about the work in front of it, not a mode.
 #[tauri::command]
 pub fn add_files(
     state: State<'_, AppState>,
@@ -543,6 +547,10 @@ pub fn add_files(
         queued.push(summary);
     }
 
+    if !queued.is_empty() {
+        state.queue.resume();
+    }
+
     queued
 }
 
@@ -551,9 +559,23 @@ pub fn cancel_job(state: State<'_, AppState>, id: String) {
     state.queue.cancel(&id);
 }
 
+/// Throw the whole queue away. Returns the state it left behind so the footer
+/// does not have to assume what clearing did.
 #[tauri::command]
-pub fn cancel_all(state: State<'_, AppState>) {
+pub fn cancel_all(state: State<'_, AppState>) -> QueueStatus {
     state.queue.cancel_all();
+    state.queue.status()
+}
+
+/// Stop working without losing the queue. See `Queue::pause`.
+#[tauri::command]
+pub fn pause_queue(state: State<'_, AppState>) -> QueueStatus {
+    state.queue.pause()
+}
+
+#[tauri::command]
+pub fn resume_queue(state: State<'_, AppState>) -> QueueStatus {
+    state.queue.resume()
 }
 
 #[tauri::command]

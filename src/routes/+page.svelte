@@ -23,7 +23,9 @@
 		onInstallProgress,
 		onJobEvent,
 		onOpenFiles,
+		pauseQueue,
 		previewPair,
+		resumeQueue,
 		revealInFolder,
 		setShellMenu,
 		startup,
@@ -118,6 +120,11 @@
 	const settings = $derived<EncodeSettings>({ ...options, target_bytes: limitBytes });
 	const soleResult = $derived(jobs.soleResult);
 
+	/* Stopping keeps the queue, so the footer has to distinguish "nothing left
+	   to do" from "plenty left, deliberately not doing it". */
+	let paused = $state(false);
+	const hasWork = $derived(jobs.hasWork);
+
 	/* A finished row can be opened to get the same result card a single file
 	   gets. Only finished jobs have a result to show, and the selection is
 	   dropped the moment that job stops existing. */
@@ -178,6 +185,9 @@
 					disposition: replacing ? 'replace' : 'keep'
 				})
 			);
+			// Adding work restarts a stopped queue, backend included. Mirroring
+			// it here rather than asking keeps the footer honest immediately.
+			paused = false;
 		} catch (error) {
 			flash(String(error));
 		}
@@ -200,6 +210,28 @@
 		}
 
 		await enqueue(launch.files);
+	}
+
+	/** Stop, keeping the queue. The file being encoded goes back in the queue. */
+	async function stop() {
+		paused = (await pauseQueue()).paused;
+	}
+
+	async function resume() {
+		paused = (await resumeQueue()).paused;
+	}
+
+	/**
+	 * Empty the list.
+	 *
+	 * Anything still queued has to be cancelled in the backend too, or the rows
+	 * would vanish while the encoder carried on working through them.
+	 */
+	async function clearList() {
+		paused = (await cancelAll()).paused;
+		jobs.clear();
+		openJobId = null;
+		preview = null;
 	}
 
 	async function browse() {
@@ -520,6 +552,7 @@
 					{#each jobs.jobs as job (job.id)}
 						<FileRow
 							{job}
+							{paused}
 							onCancel={(id) => void cancelJob(id)}
 							onRemove={(id) => {
 								jobs.remove(id);
@@ -535,7 +568,9 @@
 
 		<footer>
 			<span class="summary">
-				{#if jobs.anyRunning}
+				{#if hasWork && paused}
+					stopped · {jobs.waiting.length} waiting
+				{:else if hasWork}
 					encoding · target {formatBytes(limitBytes)}
 				{:else if jobs.finished.length > 0}
 					{jobs.finished.length} done · target {formatBytes(limitBytes)}
@@ -551,10 +586,18 @@
 				<button onclick={copyAllFinished}>Copy all</button>
 			{/if}
 
-			{#if jobs.anyRunning}
-				<button onclick={() => void cancelAll()}>Stop</button>
-			{:else if jobs.jobs.length > 0}
-				<button onclick={() => jobs.clear()}>Clear</button>
+			<!-- Stop is a pause, so it has to come back as Resume — and Clear has
+			     to be reachable next to it, or a stopped queue would be a state
+			     with no way out but dismissing every row by hand. -->
+			{#if hasWork && !paused}
+				<button onclick={() => void stop()}>Stop</button>
+			{:else}
+				{#if hasWork}
+					<button onclick={() => void resume()}>Resume</button>
+				{/if}
+				{#if jobs.jobs.length > 0}
+					<button onclick={() => void clearList()}>Clear</button>
+				{/if}
 			{/if}
 
 			<button class="primary" onclick={browse}>Add files</button>

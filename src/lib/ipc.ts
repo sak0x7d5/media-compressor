@@ -212,6 +212,14 @@ export interface QueuedFile {
 	replaces_input: boolean;
 }
 
+/** The queue as a whole — what the Stop / Resume / Clear controls are about. */
+export interface QueueStatus {
+	paused: boolean;
+	/** Jobs waiting for the worker. */
+	waiting: number;
+	running: boolean;
+}
+
 export interface UpdateInfo {
 	version: string;
 	current_version: string;
@@ -258,7 +266,11 @@ export const probeFile = (path: string) => invoke<MediaInfo>('probe_file', { pat
 export const addFiles = (paths: string[], settings: EncodeSettings) =>
 	invoke<QueuedFile[]>('add_files', { paths, settings });
 export const cancelJob = (id: string) => invoke<void>('cancel_job', { id });
-export const cancelAll = () => invoke<void>('cancel_all');
+/** Throw the queue away. */
+export const cancelAll = () => invoke<QueueStatus>('cancel_all');
+/** Stop working, keeping the queue. The running file goes back in the queue. */
+export const pauseQueue = () => invoke<QueueStatus>('pause_queue');
+export const resumeQueue = () => invoke<QueueStatus>('resume_queue');
 export const copyToClipboard = (paths: string[]) => invoke<void>('copy_to_clipboard', { paths });
 export const revealInFolder = (path: string) => invoke<void>('reveal_in_folder', { path });
 

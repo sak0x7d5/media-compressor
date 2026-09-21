@@ -213,6 +213,8 @@ pub fn run() {
             commands::add_files,
             commands::cancel_job,
             commands::cancel_all,
+            commands::pause_queue,
+            commands::resume_queue,
             commands::copy_to_clipboard,
             commands::reveal_in_folder,
             commands::preview_pair,

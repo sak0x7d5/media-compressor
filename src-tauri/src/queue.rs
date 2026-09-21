@@ -7,6 +7,17 @@
 //! The worker is a plain OS thread rather than a async task because the FFmpeg
 //! wrapper is blocking, and pretending otherwise would only move the blocking
 //! somewhere less obvious.
+//!
+//! There are two ways of stopping, because users mean two different things by
+//! it:
+//!
+//! * **Pause** keeps the queue. The encode in flight is aborted and put back at
+//!   the head, so resuming runs it again from the start and nothing is lost.
+//! * **Cancel** throws work away — one job or all of them — and it never comes
+//!   back.
+//!
+//! Whichever it is, every job must end in a state the UI can show. A row that
+//! can be neither finished nor dismissed is worse than one that failed.
 
 use crate::ffmpeg::encode::{CancelToken, Speed};
 use crate::ffmpeg::tools::FfmpegTools;
@@ -15,7 +26,7 @@ use crate::pipeline::{compress_media, CompressRequest, MediaOutcome, Stage};
 use crate::strategy::plan::Options;
 use crate::strategy::Target;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -73,6 +84,11 @@ pub struct QueueItem {
 }
 
 /// Everything the UI is told about a job.
+///
+/// Each variant names the state the job is in *now*, and every job ends in one
+/// of the three terminal ones. `Queued` is sent both when a job is first
+/// accepted and when a paused job is handed back — a row that receives it is
+/// waiting, however it got there.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "kebab-case")]
 pub enum JobEvent {
@@ -84,14 +100,55 @@ pub enum JobEvent {
     Cancelled { id: String },
 }
 
+/// The queue as a whole, which is what the footer controls are about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct QueueStatus {
+    pub paused: bool,
+    /// Jobs waiting for the worker.
+    pub waiting: usize,
+    /// Whether a job is being encoded right now.
+    pub running: bool,
+}
+
 type Listener = Arc<dyn Fn(JobEvent) + Send + Sync>;
 
+/// Why a running job was stopped. The cancel token records only *that* it was,
+/// and the worker cannot guess which the user asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Interrupt {
+    /// This one file was dismissed. It is gone.
+    Cancelled,
+    /// The whole queue paused. The file goes back, and runs again on resume.
+    Paused,
+}
+
+/// The job the worker is holding, as everyone else sees it.
+struct Running {
+    id: String,
+    token: CancelToken,
+    interrupt: Option<Interrupt>,
+}
+
+/// Every piece of queue state, under one lock.
+///
+/// Splitting the waiting list, the cancel tokens and the paused flag across
+/// separate mutexes turned every question that spans two of them — "is this id
+/// waiting, or is the worker already running it?" — into a race instead of a
+/// read. It also puts `stopping` under the lock the worker parks on, which is
+/// the only place it can be set without a window where the worker has read it
+/// as false but not yet reached `wait`, misses the notification, and parks
+/// forever.
+struct State {
+    pending: VecDeque<QueueItem>,
+    running: Option<Running>,
+    paused: bool,
+    /// Set when the queue is being dropped, so the worker stops waiting.
+    stopping: bool,
+}
+
 struct Shared {
-    pending: Mutex<VecDeque<QueueItem>>,
-    /// Tokens for jobs that are queued or running, so either can be cancelled.
-    tokens: Mutex<HashMap<String, CancelToken>>,
+    state: Mutex<State>,
     wake: Condvar,
-    stopping: Mutex<bool>,
     /// Shared with the worker. Cancelling a job that has not started removes it
     /// before the worker ever sees it, so this side has to report those itself
     /// or nothing ever will.
@@ -99,17 +156,53 @@ struct Shared {
 }
 
 impl Shared {
-    fn next(&self) -> Option<QueueItem> {
-        let mut pending = self.pending.lock().unwrap();
+    /// Block until there is work to do, and claim it.
+    ///
+    /// Returns `None` only when the queue is shutting down.
+    fn take_next(&self) -> Option<(QueueItem, CancelToken)> {
+        let mut state = self.state.lock().unwrap();
         loop {
-            if *self.stopping.lock().unwrap() {
+            if state.stopping {
                 return None;
             }
-            if let Some(item) = pending.pop_front() {
-                return Some(item);
+
+            if !state.paused {
+                if let Some(item) = state.pending.pop_front() {
+                    let token = CancelToken::new();
+                    state.running = Some(Running {
+                        id: item.id.clone(),
+                        token: token.clone(),
+                        interrupt: None,
+                    });
+                    return Some((item, token));
+                }
             }
-            pending = self.wake.wait(pending).unwrap();
+
+            state = self.wake.wait(state).unwrap();
         }
+    }
+
+    /// Give up the running slot, reporting how the job was interrupted if it
+    /// was interrupted at all.
+    fn finish(&self) -> Option<Interrupt> {
+        let mut state = self.state.lock().unwrap();
+        state.running.take().and_then(|running| running.interrupt)
+    }
+
+    /// Put a paused job back at the *head* of the queue.
+    ///
+    /// The head, not the tail: a pause must not quietly reorder the work.
+    fn requeue(&self, item: QueueItem) {
+        self.state.lock().unwrap().pending.push_front(item);
+    }
+
+    /// Emit an event, holding no locks.
+    ///
+    /// The listener reaches into the UI layer; calling it while holding the
+    /// queue's own lock invites a deadlock the first time that layer calls
+    /// back in.
+    fn announce(&self, event: JobEvent) {
+        (self.listener)(event);
     }
 }
 
@@ -120,152 +213,172 @@ pub struct Queue {
 impl Queue {
     /// Start the worker. `tools` is resolved lazily per job so a queue can be
     /// built before FFmpeg has finished installing.
-    pub fn start(
-        tools: Arc<Mutex<Option<FfmpegTools>>>,
-        listener: Listener,
-    ) -> Self {
+    pub fn start(tools: Arc<Mutex<Option<FfmpegTools>>>, listener: Listener) -> Self {
         let shared = Arc::new(Shared {
-            pending: Mutex::new(VecDeque::new()),
-            tokens: Mutex::new(HashMap::new()),
+            state: Mutex::new(State {
+                pending: VecDeque::new(),
+                running: None,
+                paused: false,
+                stopping: false,
+            }),
             wake: Condvar::new(),
-            stopping: Mutex::new(false),
-            listener: Arc::clone(&listener),
+            listener,
         });
 
         let worker_shared = Arc::clone(&shared);
         std::thread::Builder::new()
             .name("encode-worker".to_string())
-            .spawn(move || worker(worker_shared, tools, listener))
+            .spawn(move || worker(worker_shared, tools))
             .expect("the encode worker thread must start");
 
         Self { shared }
     }
 
+    /// Accept a job.
+    ///
+    /// Pushing onto a paused queue leaves it paused. Whether adding a file
+    /// should also set the queue going again is a question about what the user
+    /// meant by it, so it is answered a layer up, in the command that takes
+    /// files.
     pub fn push(&self, item: QueueItem) {
-        self.shared
-            .tokens
-            .lock()
-            .unwrap()
-            .insert(item.id.clone(), CancelToken::new());
-        self.shared.pending.lock().unwrap().push_back(item);
-        self.shared.wake.notify_one();
+        self.shared.state.lock().unwrap().pending.push_back(item);
+        self.shared.wake.notify_all();
     }
 
-    /// Cancel a job whether it is running or still waiting.
+    /// Cancel one job, whether it is running or still waiting.
     pub fn cancel(&self, id: &str) {
-        // Flip the token first: if the job is running, this is what stops it,
-        // and the worker reports it when the encode aborts.
-        if let Some(token) = self.shared.tokens.lock().unwrap().get(id) {
-            token.cancel();
-        }
+        let removed = {
+            let mut state = self.shared.state.lock().unwrap();
 
-        // Then drop it from the queue, so a job that had not started yet never
-        // does. Removing before cancelling would race a job that starts in
-        // between the two.
-        let was_waiting = {
-            let mut pending = self.shared.pending.lock().unwrap();
-            let before = pending.len();
-            pending.retain(|item| item.id != id);
-            pending.len() != before
+            if let Some(running) = state.running.as_mut() {
+                if running.id == id {
+                    // The worker owns reporting a job it is holding, but it
+                    // cannot tell this from a pause unless it is told.
+                    running.interrupt = Some(Interrupt::Cancelled);
+                    running.token.cancel();
+                    return;
+                }
+            }
+
+            let before = state.pending.len();
+            state.pending.retain(|item| item.id != id);
+            state.pending.len() != before
         };
 
-        // A job pulled from the queue never reaches the worker, so this is the
-        // only place that can report it. Without this the row sits on "queued"
-        // forever and no amount of clicking dismisses it.
-        if was_waiting {
-            self.shared.tokens.lock().unwrap().remove(id);
-            self.announce(JobEvent::Cancelled { id: id.to_string() });
+        // A waiting job never reaches the worker, so this is the only place
+        // that can report it. Without this the row sits on "queued" forever and
+        // no amount of clicking dismisses it.
+        if removed {
+            self.shared.announce(JobEvent::Cancelled { id: id.to_string() });
         }
     }
 
+    /// Throw everything away: the job running and every job waiting.
     pub fn cancel_all(&self) {
-        for token in self.shared.tokens.lock().unwrap().values() {
-            token.cancel();
-        }
-
         let abandoned: Vec<String> = {
-            let mut pending = self.shared.pending.lock().unwrap();
-            pending.drain(..).map(|item| item.id).collect()
+            let mut state = self.shared.state.lock().unwrap();
+
+            // Discarding the queue lifts a pause too. Leaving it set would hand
+            // back an empty queue that is still refusing to run, and the only
+            // clue would be a Resume button with nothing to resume.
+            state.paused = false;
+
+            if let Some(running) = state.running.as_mut() {
+                running.interrupt = Some(Interrupt::Cancelled);
+                running.token.cancel();
+            }
+
+            state.pending.drain(..).map(|item| item.id).collect()
         };
+
+        self.shared.wake.notify_all();
 
         for id in abandoned {
-            self.shared.tokens.lock().unwrap().remove(&id);
-            self.announce(JobEvent::Cancelled { id });
+            self.shared.announce(JobEvent::Cancelled { id });
         }
     }
 
-    /// Emit an event, holding no locks.
+    /// Stop working, keeping the queue intact.
     ///
-    /// The listener reaches into the UI layer; calling it while holding the
-    /// queue's own locks invites a deadlock the first time that layer calls
-    /// back in.
-    fn announce(&self, event: JobEvent) {
-        (self.shared.listener)(event);
+    /// The encode in flight is aborted and handed back to the front of the
+    /// queue, so resuming runs it again from the start. FFmpeg cannot freeze an
+    /// encode and pick it up later, and holding a suspended process — with its
+    /// open handles and its half-written file — for however long the user is
+    /// away is worse than paying for those seconds twice.
+    pub fn pause(&self) -> QueueStatus {
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            state.paused = true;
+
+            if let Some(running) = state.running.as_mut() {
+                // An explicit cancel already claimed this job. A pause must not
+                // turn it back into something that runs again.
+                if running.interrupt.is_none() {
+                    running.interrupt = Some(Interrupt::Paused);
+                    running.token.cancel();
+                }
+            }
+        }
+
+        self.status()
+    }
+
+    /// Start working through the queue again.
+    pub fn resume(&self) -> QueueStatus {
+        self.shared.state.lock().unwrap().paused = false;
+        self.shared.wake.notify_all();
+        self.status()
+    }
+
+    pub fn status(&self) -> QueueStatus {
+        let state = self.shared.state.lock().unwrap();
+        QueueStatus {
+            paused: state.paused,
+            waiting: state.pending.len(),
+            running: state.running.is_some(),
+        }
     }
 
     pub fn pending_count(&self) -> usize {
-        self.shared.pending.lock().unwrap().len()
+        self.shared.state.lock().unwrap().pending.len()
     }
 
     /// Jobs either running or waiting to run.
     ///
     /// [`Self::pending_count`] answers a narrower question: it does not count
     /// the job the worker is inside right now, which is precisely the one that
-    /// would notice its `ffmpeg` being deleted out from under it. A token
-    /// exists from the moment a job is pushed until the moment it finishes, so
-    /// counting those is the honest answer to "is anything using FFmpeg?"
+    /// would notice its `ffmpeg` being deleted out from under it. The running
+    /// slot is held from the moment the worker claims a job until the encode
+    /// ends, so counting it alongside the waiting list is the honest answer to
+    /// "is anything using FFmpeg?"
     pub fn active_count(&self) -> usize {
-        self.shared.tokens.lock().unwrap().len()
+        let state = self.shared.state.lock().unwrap();
+        state.pending.len() + usize::from(state.running.is_some())
     }
 }
 
 impl Drop for Queue {
     fn drop(&mut self) {
+        // Under the same lock the worker waits on — see `State::stopping`.
+        self.shared.state.lock().unwrap().stopping = true;
         self.cancel_all();
-
-        // `stopping` has to be set while holding `pending`, because that is the
-        // lock the worker is parked on. Setting it outside leaves a window
-        // where the worker has already read `stopping` as false but has not yet
-        // reached `wait`, so it misses the notification and parks forever.
-        let pending = self.shared.pending.lock().unwrap();
-        *self.shared.stopping.lock().unwrap() = true;
         self.shared.wake.notify_all();
-        drop(pending);
     }
 }
 
-fn worker(
-    shared: Arc<Shared>,
-    tools: Arc<Mutex<Option<FfmpegTools>>>,
-    listener: Listener,
-) {
-    while let Some(mut item) = shared.next() {
-        let token = shared
-            .tokens
-            .lock()
-            .unwrap()
-            .get(&item.id)
-            .cloned()
-            .unwrap_or_default();
-
-        // Cancelled while it sat in the queue.
-        if token.is_cancelled() {
-            listener(JobEvent::Cancelled { id: item.id.clone() });
-            shared.tokens.lock().unwrap().remove(&item.id);
-            continue;
-        }
-
+fn worker(shared: Arc<Shared>, tools: Arc<Mutex<Option<FfmpegTools>>>) {
+    while let Some((mut item, token)) = shared.take_next() {
         let resolved = tools.lock().unwrap().clone();
         let Some(tools) = resolved else {
-            listener(JobEvent::Failed {
+            shared.finish();
+            shared.announce(JobEvent::Failed {
                 id: item.id.clone(),
                 message: "FFmpeg is not installed yet".to_string(),
             });
-            shared.tokens.lock().unwrap().remove(&item.id);
             continue;
         };
 
-        listener(JobEvent::Started { id: item.id.clone() });
+        shared.announce(JobEvent::Started { id: item.id.clone() });
 
         settle_output(&mut item);
 
@@ -280,14 +393,19 @@ fn worker(
             max_dimension: item.max_dimension,
         };
 
-        let progress_listener = Arc::clone(&listener);
+        let progress_listener = Arc::clone(&shared.listener);
         let id = item.id.clone();
         let result = compress_media(&tools, &request, &token, move |stage: Stage| {
             progress_listener(JobEvent::Progress { id: id.clone(), stage });
         });
 
+        // Why it stopped has to be read before anything is announced: the
+        // running slot must be free before the job can go back in the queue.
+        let interrupt = shared.finish();
+
         match result {
-            Ok(outcome) => listener(settle(&item, outcome)),
+            // Finishing just as a pause landed still counts as finished.
+            Ok(outcome) => shared.announce(settle(&item, outcome)),
             Err(error) => {
                 // A replacement encodes into the user's own folder, so a job
                 // that ended early leaves a half-written scratch file sitting
@@ -296,15 +414,27 @@ fn worker(
                     let _ = std::fs::remove_file(&item.output);
                 }
 
-                if error.is_cancellation() {
-                    listener(JobEvent::Cancelled { id: item.id.clone() });
+                if !error.is_cancellation() {
+                    shared.announce(JobEvent::Failed {
+                        id: item.id.clone(),
+                        message: error.to_string(),
+                    });
+                } else if interrupt == Some(Interrupt::Paused) {
+                    // Back to the front of the queue, announced the way it was
+                    // when first accepted: the row shows where the file will
+                    // end up, never the scratch file a replacement passes
+                    // through.
+                    let id = item.id.clone();
+                    let input = item.input.to_string_lossy().to_string();
+                    let destination = item.replacement.as_ref().unwrap_or(&item.output);
+                    let output = destination.to_string_lossy().to_string();
+                    shared.requeue(item);
+                    shared.announce(JobEvent::Queued { id, input, output });
                 } else {
-                    listener(JobEvent::Failed { id: item.id.clone(), message: error.to_string() });
+                    shared.announce(JobEvent::Cancelled { id: item.id.clone() });
                 }
             }
         }
-
-        shared.tokens.lock().unwrap().remove(&item.id);
     }
 }
 
@@ -606,6 +736,9 @@ pub fn staging_path_for(input: &Path, extension: &str, id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::mpsc::Receiver;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn the_default_output_sits_beside_the_input_and_never_overwrites_it() {
@@ -1213,8 +1346,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn a_queue_with_no_tools_fails_jobs_rather_than_hanging() {
+    /// A queue with no FFmpeg behind it. Every job fails the moment the worker
+    /// picks it up, which is what makes the scheduling observable: an event
+    /// means the worker took the job, silence means it did not.
+    fn test_queue() -> (Queue, Receiver<JobEvent>) {
         let tools: Arc<Mutex<Option<FfmpegTools>>> = Arc::new(Mutex::new(None));
         let (tx, rx) = std::sync::mpsc::channel();
 
@@ -1225,28 +1360,7 @@ mod tests {
             }),
         );
 
-        queue.push(QueueItem {
-            id: "job-1".to_string(),
-            input: PathBuf::from("in.mp4"),
-            output: PathBuf::from("out.mp4"),
-            target: Target::new(20_000_000),
-            options: Options::default(),
-            speed: Speed::Fast,
-            work_dir: std::env::temp_dir().join("mc-queue-test"),
-            image_format: ImageFormat::Webp,
-            max_dimension: None,
-            output_dir: None,
-            replacement: None,
-        });
-
-        let event = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("the queue should report something rather than hang");
-
-        assert!(
-            matches!(event, JobEvent::Failed { .. }),
-            "expected a failure, got {event:?}"
-        );
+        (queue, rx)
     }
 
     fn waiting_item(id: &str) -> QueueItem {
@@ -1265,35 +1379,12 @@ mod tests {
         }
     }
 
-    /// The invariant a stalled row exposed: every job must end in *some*
-    /// reported state. Cancelling used to pull waiting jobs out of the queue
-    /// before the worker could see them, so nothing ever reported those — the
-    /// row sat on "queued" forever and could not be dismissed.
-    #[test]
-    fn every_job_is_reported_even_when_cancelled_before_it_runs() {
-        use std::collections::HashSet;
-        use std::time::{Duration, Instant};
-
-        let tools: Arc<Mutex<Option<FfmpegTools>>> = Arc::new(Mutex::new(None));
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        let queue = Queue::start(
-            tools,
-            Arc::new(move |event| {
-                let _ = tx.send(event);
-            }),
-        );
-
-        let ids: Vec<String> = (0..6).map(|n| format!("bulk-{n}")).collect();
-        for id in &ids {
-            queue.push(waiting_item(id));
-        }
-        queue.cancel_all();
-
+    /// The ids that reached a terminal state, giving up after ten seconds.
+    fn settled_ids(rx: &Receiver<JobEvent>, expected: usize) -> HashSet<String> {
         let mut settled: HashSet<String> = HashSet::new();
         let deadline = Instant::now() + Duration::from_secs(10);
 
-        while settled.len() < ids.len() && Instant::now() < deadline {
+        while settled.len() < expected && Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(250)) {
                 // Either terminal state is acceptable; being told nothing is not.
                 Ok(JobEvent::Cancelled { id }) | Ok(JobEvent::Failed { id, .. }) => {
@@ -1304,44 +1395,144 @@ mod tests {
             }
         }
 
+        settled
+    }
+
+    #[test]
+    fn a_queue_with_no_tools_fails_jobs_rather_than_hanging() {
+        let (queue, rx) = test_queue();
+        queue.push(waiting_item("job-1"));
+
+        let event = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the queue should report something rather than hang");
+
+        assert!(
+            matches!(event, JobEvent::Failed { .. }),
+            "expected a failure, got {event:?}"
+        );
+    }
+
+    /// The invariant a stalled row exposed: every job must end in *some*
+    /// reported state. Cancelling used to pull waiting jobs out of the queue
+    /// before the worker could see them, so nothing ever reported those — the
+    /// row sat on "queued" forever and could not be dismissed.
+    #[test]
+    fn every_job_is_reported_even_when_cancelled_before_it_runs() {
+        let (queue, rx) = test_queue();
+
+        let ids: Vec<String> = (0..6).map(|n| format!("bulk-{n}")).collect();
+        for id in &ids {
+            queue.push(waiting_item(id));
+        }
+        queue.cancel_all();
+
+        let settled = settled_ids(&rx, ids.len());
         let stranded: Vec<&String> = ids.iter().filter(|id| !settled.contains(*id)).collect();
         assert!(stranded.is_empty(), "these jobs were never reported: {stranded:?}");
     }
 
     #[test]
     fn cancelling_a_queued_job_stops_it_ever_running() {
-        let tools: Arc<Mutex<Option<FfmpegTools>>> = Arc::new(Mutex::new(None));
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (queue, rx) = test_queue();
 
-        let queue = Queue::start(
-            tools,
-            Arc::new(move |event| {
-                let _ = tx.send(event);
-            }),
-        );
-
-        let item = QueueItem {
-            id: "job-2".to_string(),
-            input: PathBuf::from("in.mp4"),
-            output: PathBuf::from("out.mp4"),
-            target: Target::new(20_000_000),
-            options: Options::default(),
-            speed: Speed::Fast,
-            work_dir: std::env::temp_dir().join("mc-queue-test"),
-            image_format: ImageFormat::Webp,
-            max_dimension: None,
-            output_dir: None,
-            replacement: None,
-        };
-
+        let item = waiting_item("job-2");
         queue.cancel(&item.id);
         queue.push(item);
 
-        // The push re-registers a fresh token, so this asserts the weaker but
-        // still important property: the queue always resolves a job somehow.
+        // Cancelling an id nobody has queued yet is a no-op, so this asserts
+        // the weaker but still important property: the queue always resolves
+        // a job somehow.
         let event = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(5))
             .expect("the queue should resolve the job");
         assert!(matches!(event, JobEvent::Failed { .. } | JobEvent::Cancelled { .. }));
+    }
+
+    #[test]
+    fn a_paused_queue_starts_nothing_and_resuming_drains_it() {
+        let (queue, rx) = test_queue();
+
+        queue.pause();
+        queue.push(waiting_item("held-1"));
+        queue.push(waiting_item("held-2"));
+
+        assert_eq!(queue.status(), QueueStatus { paused: true, waiting: 2, running: false });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a paused queue must not start anything"
+        );
+
+        queue.resume();
+
+        assert_eq!(
+            settled_ids(&rx, 2).len(),
+            2,
+            "resuming must run everything that was held"
+        );
+        assert_eq!(queue.status().waiting, 0);
+    }
+
+    /// The property the Stop button rests on: stopping is not a one-way door,
+    /// and the work is still there afterwards.
+    #[test]
+    fn pausing_keeps_the_waiting_jobs() {
+        let (queue, _rx) = test_queue();
+
+        queue.pause();
+        for n in 0..4 {
+            queue.push(waiting_item(&format!("kept-{n}")));
+        }
+
+        let status = queue.pause();
+        assert!(status.paused);
+        assert_eq!(status.waiting, 4, "a pause must not discard the queue");
+    }
+
+    #[test]
+    fn a_job_cancelled_while_it_waits_is_reported_and_never_starts() {
+        let (queue, rx) = test_queue();
+
+        queue.pause();
+        queue.push(waiting_item("doomed"));
+        queue.push(waiting_item("survivor"));
+
+        queue.cancel("doomed");
+
+        // Reported straight away: the worker is paused and will never see it.
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(JobEvent::Cancelled { id }) => assert_eq!(id, "doomed"),
+            other => panic!("expected doomed to be cancelled, got {other:?}"),
+        }
+
+        queue.resume();
+
+        let settled = settled_ids(&rx, 1);
+        assert!(settled.contains("survivor"), "the rest of the queue must still run");
+        assert!(
+            !settled.contains("doomed"),
+            "a cancelled job must not run when the queue resumes"
+        );
+    }
+
+    /// Discarding a paused queue has to leave it able to run again, or the next
+    /// file added would sit there with no clue why.
+    #[test]
+    fn clearing_a_paused_queue_lifts_the_pause() {
+        let (queue, rx) = test_queue();
+
+        queue.pause();
+        queue.push(waiting_item("dropped"));
+        queue.cancel_all();
+
+        assert!(!queue.status().paused);
+
+        queue.push(waiting_item("after"));
+
+        // Two events: the job the clear threw away, and the one added since.
+        assert!(
+            settled_ids(&rx, 2).contains("after"),
+            "a queue cleared while paused must accept new work"
+        );
     }
 }

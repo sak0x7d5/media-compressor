@@ -457,7 +457,7 @@ src-tauri/src/
 ├── ffmpeg/         locating, acquiring, probing, encoding, sampling
 ├── images.rs       binary-search quality targeting
 ├── pipeline.rs     probe → plan → encode → verify → correct
-├── queue.rs        serial video, per-job cancellation
+├── queue.rs        serial video, pause/resume, per-job cancellation
 └── commands.rs     the surface the UI calls
 ```
 

@@ -169,7 +169,12 @@ export class JobList {
 		return this.jobs.filter((job) => job.state === 'done');
 	}
 
-	get anyRunning(): boolean {
+	get waiting(): Job[] {
+		return this.jobs.filter((job) => job.state === 'queued');
+	}
+
+	/** Anything left to do — running now or waiting its turn. */
+	get hasWork(): boolean {
 		return this.jobs.some((job) => job.state === 'running' || job.state === 'queued');
 	}
 
@@ -210,8 +215,15 @@ export class JobList {
 		this.#buffered.delete(id);
 	}
 
+	/**
+	 * Empty the list.
+	 *
+	 * Rows for work still in the queue go too, so the caller must cancel that
+	 * work in the backend first — otherwise it would carry on encoding files
+	 * that are no longer on screen.
+	 */
 	clear() {
-		this.jobs = this.jobs.filter((job) => job.state === 'running' || job.state === 'queued');
+		this.jobs = [];
 	}
 
 	apply(event: JobEvent) {
@@ -222,7 +234,17 @@ export class JobList {
 		}
 
 		switch (event.event) {
+			// Also how a paused job comes back. The encode it had done was
+			// thrown away, so the row returns to exactly what it looked like
+			// before it started rather than keeping a percentage that no longer
+			// means anything.
 			case 'queued':
+				job.state = 'queued';
+				job.status = 'queued';
+				job.fraction = 0;
+				job.detail = formatBytes(job.inputBytes);
+				job.outcome = undefined;
+				job.error = undefined;
 				break;
 
 			case 'started':
