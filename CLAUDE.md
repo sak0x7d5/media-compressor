@@ -37,7 +37,8 @@ when FFmpeg is missing — add `-- --nocapture` to see whether they actually ran
 rather than assuming green means covered.
 
 `MEDIA_COMPRESSOR_FFMPEG=<dir containing ffmpeg+ffprobe>` points any build at a
-specific FFmpeg. Debug builds additionally fall back to PATH, which is why
+specific FFmpeg. Every build also looks on PATH and adopts what it finds if it
+has every encoder the app can ask for (`ffmpeg/system.rs`), which is why
 `pnpm tauri dev` works before the first-run download.
 
 **Do not run `cargo fmt`.** There is no `rustfmt.toml` and the code is written
@@ -62,8 +63,9 @@ ffmpeg/probe  strategy/   ffmpeg/sample   ffmpeg/encode   strategy/plan
   process. **Its tests are the specification** — change behaviour here and the
   test that fails is telling you which trade-off you just reversed.
 - **`src-tauri/src/ffmpeg/`** — everything impure. `tools.rs` locates the
-  binaries (cache dir → env override → PATH, debug only) and verifies them by
-  *executing* them; `acquire.rs` downloads and installs; `probe.rs` reads
+  binaries (app download → env override → PATH) and verifies them by
+  *executing* them; `system.rs` decides whether a PATH build carries every
+  encoder we need and caches the answer; `acquire.rs` downloads and installs; `probe.rs` reads
   source metadata; `sample.rs` encodes three short slices to predict a CRF
   encode's full size; `encode.rs` builds argument vectors as a pure function
   (so two-pass logs and scale filters are assertable) and runs them.
@@ -108,9 +110,10 @@ Before "simplifying" any of these, read the comment above it:
 - `strategy/` stays free of I/O, FFmpeg and async.
 - FFmpeg is invoked as a separate executable. Linking libav would put the whole
   app under the GPL.
-- Release builds never fall back to PATH — system FFmpeg builds differ in which
-  encoders were compiled in, which turns a missing encoder into an
-  unreproducible bug report.
+- A PATH FFmpeg is adopted only after it proves it has every encoder we use —
+  system builds differ in which encoders were compiled in, and trusting one
+  blindly turns a missing encoder into an unreproducible bug report. The env
+  override is deliberately exempt from that gate.
 - Attempt caps exist for wall-clock reasons: `MAX_ATTEMPTS = 3` (an unbounded
   bisection turns a 40-second job into four minutes), `MAX_SEARCH_STEPS = 7`
   for images.
@@ -143,7 +146,8 @@ per commit — never mix a refactor with a behaviour change, because then neithe
 can be reviewed nor reverted.
 
 Committing on a feature branch is expected and does not need to be asked about.
-**Pushing does** — `git push` is denied in `.claude/settings.json` on purpose.
+**Pushing does** — ask before any `git push`; it is not on the allow-list in
+`.claude/settings.json`, so it prompts rather than runs.
 
 **Conventional Commits**, matching what is already in the log:
 
