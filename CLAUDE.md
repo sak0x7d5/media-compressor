@@ -72,8 +72,15 @@ ffmpeg/probe  strategy/   ffmpeg/sample   ffmpeg/encode   strategy/plan
 - **`pipeline.rs`** — sequences the above for one file and reports every
   decision through an `on_stage` callback so the UI can show reasoning.
 - **`queue.rs`** — one OS worker thread; videos run strictly serially because
-  FFmpeg already saturates every core. Cancellation flips the token *before*
-  dropping the item from the queue, so a job that starts mid-cancel still stops.
+  FFmpeg already saturates every core. All scheduling state — the waiting
+  list, the running job and its cancel token, the paused flag — sits under one
+  lock, so "is this id waiting or already running?" is a read, not a race.
+  Stop *pauses*: the running encode is aborted and re-queued at the head;
+  Cancel discards. Either way every job ends in a reported terminal state.
+- **`changelog.rs` / `updates.rs`** — `CHANGELOG.md` is `include_str!`'d and
+  parsed (a test pins its newest entry to the build version, so unshipped
+  work goes under `[Unreleased]`); the updater drives `tauri-plugin-updater`
+  and decides which entries this profile has not yet been shown.
 - **`commands.rs`** — the whole `#[tauri::command]` surface plus `AppState`
   (tools, queue, cache/config/work dirs). Registered in `lib.rs`.
 - **`presets.rs`** — upload limits as layered data: compiled-in list →
@@ -92,7 +99,8 @@ that they agree**. When you change a serialized Rust type, update `ipc.ts` in
 the same commit. Watch the serde attributes: `Stage` is tagged on `stage`,
 `JobEvent` on `event`, `MediaOutcome` on `kind`, all `rename_all =
 "kebab-case"`. Event channel names are constants on both sides (`EVENT_JOB`,
-`EVENT_INSTALL` in `commands.rs`; `EVENT_OPEN_FILES` in `lib.rs`).
+`EVENT_INSTALL` in `commands.rs`; `EVENT_OPEN_FILES` in `lib.rs`;
+`EVENT_UPDATE` in `updates.rs`).
 
 ### Windows specifics
 
