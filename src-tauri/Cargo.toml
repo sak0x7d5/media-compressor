@@ -1,6 +1,6 @@
 [package]
 name = "media-compressor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Size-targeted video and image compressor"
 authors = ["sak0x7d5"]
 edition = "2021"

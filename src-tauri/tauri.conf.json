@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Media Compressor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "io.github.sak0x7d5.mediacompressor",
   "build": {
     "beforeDevCommand": "pnpm dev",
