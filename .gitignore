@@ -24,3 +24,6 @@ ffmpeg2pass-*.log*
 
 # Personal tool approvals, full of machine-specific absolute paths.
 .claude/settings.local.json
+
+# Personal scratch task list, deliberately not shared.
+TODO.md
