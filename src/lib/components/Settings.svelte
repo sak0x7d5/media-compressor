@@ -10,10 +10,8 @@
 	} from '$lib/ipc';
 	import { confirm, open } from '@tauri-apps/plugin-dialog';
 	import {
-		checkForUpdate,
 		ffmpegVersion,
 		installFfmpeg,
-		installUpdate,
 		onInstallProgress,
 		setPresetsUrl,
 		setShellMenu,
@@ -22,10 +20,12 @@
 		useSystemFfmpeg
 	} from '$lib/ipc';
 	import { formatBytes } from '$lib/format';
+	import type { Updater } from '$lib/updates.svelte';
 
 	let {
 		settings,
 		status,
+		shellSupported,
 		presetsSourceUrl,
 		outputMode,
 		outputDir,
@@ -33,17 +33,28 @@
 		onPresets,
 		onOutput,
 		onFfmpeg,
+		appVersion,
+		autoCheck,
+		updater,
+		onAutoCheck,
+		onReleaseNotes,
 		onClose
 	}: {
 		settings: EncodeSettings;
 		status: FfmpegStatus | null;
+		shellSupported: boolean;
 		presetsSourceUrl: string;
 		outputMode: OutputMode;
 		outputDir: string | null;
+		appVersion: string;
+		autoCheck: boolean;
+		updater: Updater;
 		onChange: (patch: Partial<EncodeSettings>) => void;
 		onPresets: (presets: PresetFile) => void;
 		onOutput: (mode: OutputMode, dir: string | null) => void;
 		onFfmpeg: (status: FfmpegStatus) => void;
+		onAutoCheck: (enabled: boolean) => void;
+		onReleaseNotes: () => void;
 		onClose: () => void;
 	} = $props();
 
@@ -62,7 +73,7 @@
 
 	onMount(() => {
 		void (async () => {
-			shellMenu = await shellMenuStatus();
+			shellMenu = (await shellMenuStatus()).enabled;
 		})();
 		void (async () => {
 			version = await ffmpegVersion();
@@ -167,39 +178,6 @@
 	let shellBusy = $state(false);
 	let shellError = $state<string | null>(null);
 
-	type UpdateState =
-		| { kind: 'idle' }
-		| { kind: 'checking' }
-		| { kind: 'current' }
-		| { kind: 'available'; version: string }
-		| { kind: 'installing' }
-		| { kind: 'failed'; message: string };
-
-	let update = $state<UpdateState>({ kind: 'idle' });
-
-	async function checkUpdates() {
-		update = { kind: 'checking' };
-		try {
-			const found = await checkForUpdate();
-			// Null means up to date. That is genuinely different from a failed
-			// check, so the two never share a message.
-			update = found ? { kind: 'available', version: found.version } : { kind: 'current' };
-		} catch (error) {
-			update = { kind: 'failed', message: String(error) };
-		}
-	}
-
-	async function applyUpdate() {
-		update = { kind: 'installing' };
-		try {
-			// On success the app restarts into the new version, so nothing after
-			// this runs.
-			await installUpdate();
-		} catch (error) {
-			update = { kind: 'failed', message: String(error) };
-		}
-	}
-
 	/* Kept in sync with the prop rather than seeded from it once: saving writes
 	   a new preset file back through the parent, and a field that captured only
 	   the initial value would then disagree with what is stored. */
@@ -225,7 +203,7 @@
 		shellBusy = true;
 		shellError = null;
 		try {
-			shellMenu = await setShellMenu(enabled);
+			shellMenu = (await setShellMenu(enabled)).enabled;
 		} catch (error) {
 			shellError = String(error);
 		} finally {
@@ -356,14 +334,20 @@
 		little under the line absorbs that.
 	</p>
 
-	<div class="row">
-		<span class="name">Explorer right-click</span>
-		<button class="toggle" class:on={shellMenu} disabled={shellBusy} onclick={() => toggleShellMenu(!shellMenu)}>
-			{shellMenu ? 'Enabled' : 'Disabled'}
-		</button>
-	</div>
-	{#if shellError}
-		<p class="warn">{shellError}</p>
+	{#if shellSupported}
+		<div class="row">
+			<span class="name">Explorer right-click</span>
+			<button class="toggle" class:on={shellMenu} disabled={shellBusy} onclick={() => toggleShellMenu(!shellMenu)}>
+				{shellMenu ? 'Enabled' : 'Disabled'}
+			</button>
+		</div>
+		<p class="hint">
+			Adds “Compress for Discord” to videos and images. On Windows&nbsp;11 it sits under “Show
+			more options”.
+		</p>
+		{#if shellError}
+			<p class="warn">{shellError}</p>
+		{/if}
 	{/if}
 
 	<div class="row stack">
@@ -430,32 +414,42 @@
 		<p class="warn">{ffmpegError}</p>
 	{/if}
 
-	<div class="row">
-		<span class="name">Updates</span>
-		{#if update.kind === 'available'}
-			<button class="toggle on" onclick={applyUpdate}>Install {update.version}</button>
-		{:else}
-			<button
-				class="toggle"
-				disabled={update.kind === 'checking' || update.kind === 'installing'}
-				onclick={checkUpdates}
-			>
-				{update.kind === 'checking'
-					? 'Checking…'
-					: update.kind === 'installing'
-						? 'Installing…'
-						: 'Check now'}
+	<div class="group">
+		<span class="section">Updates</span>
+
+		<div class="row">
+			<span class="name">Check on launch</span>
+			<button class="toggle" class:on={autoCheck} onclick={() => onAutoCheck(!autoCheck)}>
+				{autoCheck ? 'Enabled' : 'Disabled'}
 			</button>
+		</div>
+		<p class="hint">
+			Asks the release page whether anything newer exists, a few seconds after startup. Nothing
+			is downloaded until you say so, and turning this off leaves "Check now" as the only path.
+		</p>
+
+		<div class="row">
+			<span class="name">Version {appVersion}</span>
+			<span class="control">
+				<button class="toggle" onclick={onReleaseNotes}>Release notes</button>
+				<button
+					class="toggle"
+					disabled={updater.phase === 'checking' || updater.busy}
+					onclick={() => void updater.check(true)}
+				>
+					{updater.phase === 'checking' ? 'Checking…' : 'Check now'}
+				</button>
+			</span>
+		</div>
+
+		{#if updater.phase === 'current'}
+			<p class="hint">This is the newest release.</p>
+		{:else if updater.phase === 'available'}
+			<p class="hint">Version {updater.version} is ready — the bar at the top will install it.</p>
+		{:else if updater.phase === 'error'}
+			<p class="warn">{updater.message}</p>
 		{/if}
 	</div>
-	{#if update.kind === 'current'}
-		<p class="hint">You're on the newest version.</p>
-	{:else if update.kind === 'failed'}
-		<p class="hint">
-			Couldn't reach the update server. That's expected while the project repository is
-			private — no releases are published yet.
-		</p>
-	{/if}
 
 	<div class="foot">
 		<span class="mono">
@@ -571,11 +565,32 @@
 		outline: none;
 	}
 
+	.group {
+		margin-top: 14px;
+		padding-top: 12px;
+		border-top: 1px solid var(--border);
+	}
+
+	.section {
+		display: block;
+		font-size: 10px;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--text-muted);
+		margin-bottom: 2px;
+	}
+
 	.control {
 		display: flex;
 		align-items: center;
 		gap: 8px;
 		min-width: 190px;
+	}
+
+	/* Two buttons sharing the slot a single select would occupy. */
+	.control .toggle {
+		flex: 1;
+		min-width: 0;
 	}
 
 	.control input {

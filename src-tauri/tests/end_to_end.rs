@@ -6,12 +6,13 @@
 //! Skipped with a printed note when FFmpeg cannot be found, so `cargo test` on
 //! a bare machine stays green instead of failing for the wrong reason.
 
-use media_compressor_lib::ffmpeg::encode::{CancelToken, Speed};
+use media_compressor_lib::ffmpeg::encode::{self, CancelToken, EncodeJob, Pass, Speed};
 use media_compressor_lib::ffmpeg::probe::probe;
 use media_compressor_lib::ffmpeg::tools::FfmpegTools;
 use media_compressor_lib::images::ImageFormat;
 use media_compressor_lib::pipeline::{compress, compress_media, CompressRequest, Stage};
-use media_compressor_lib::strategy::plan::{Options, RateControl};
+use media_compressor_lib::strategy::ladder::Scale;
+use media_compressor_lib::strategy::plan::{EncodePlan, Options, RateControl};
 use media_compressor_lib::strategy::{Target, VideoCodec};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -260,7 +261,7 @@ fn a_tight_target_forces_two_pass_and_a_downscale() {
 }
 
 #[test]
-fn cancelling_stops_the_encode_and_leaves_no_scratch_files() {
+fn cancelling_stops_the_encode_and_leaves_nothing_behind() {
     let Some(tools) = tools() else {
         eprintln!("skipping: no ffmpeg available");
         return;
@@ -276,19 +277,30 @@ fn cancelling_stops_the_encode_and_leaves_no_scratch_files() {
     let cancel = CancelToken::new();
     let mut seen_progress = 0;
 
-    let result = compress(&tools, &request(&input, &output, &work, 2_000_000), &cancel, |stage| {
-        if matches!(stage, Stage::Encoding(_)) {
-            seen_progress += 1;
-            // Let it get going, then pull the plug.
-            if seen_progress >= 2 {
-                cancel.cancel();
+    // Through the entry point the queue uses: that is the layer which owns
+    // clearing up a destination this run created and did not finish.
+    let result = compress_media(
+        &tools,
+        &request(&input, &output, &work, 2_000_000),
+        &cancel,
+        |stage| {
+            if matches!(stage, Stage::Encoding(_)) {
+                seen_progress += 1;
+                // Let it get going, then pull the plug.
+                if seen_progress >= 2 {
+                    cancel.cancel();
+                }
             }
-        }
-    });
+        },
+    );
 
     let error = result.expect_err("a cancelled job must not report success");
     assert!(error.is_cancellation(), "expected cancellation, got {error}");
     assert!(!work.exists(), "the work directory should be cleaned up on cancel");
+    // The encode had started, so there was a truncated file at the destination.
+    // Leaving it there passes it off as a result and makes the next run pick a
+    // "(compressed 2)" name to avoid it.
+    assert!(!output.exists(), "a cancelled encode should not leave a partial file");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -425,6 +437,78 @@ fn a_pre_existing_file_at_the_output_path_is_never_deleted() {
 
     assert!(result.is_err(), "a cancelled job must not report success");
     assert!(output.is_file(), "a file we did not create must survive");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The assumption the correction speed-up rests on: that x264 will accept a
+/// statistics file written by an *earlier* job's first pass and produce a
+/// correct, rate-controlled file from it.
+///
+/// Unit tests can only show that `passes()` returns one pass. Whether FFmpeg
+/// then honours the log — rather than erroring on it, or quietly ignoring it
+/// and free-running the bitrate — is a question only the real encoder answers.
+#[test]
+fn a_second_pass_can_spend_statistics_an_earlier_attempt_wrote() {
+    let Some(tools) = tools() else {
+        eprintln!("skipping: no ffmpeg available");
+        return;
+    };
+
+    let dir = scratch("passlog-reuse");
+    let input = dir.join("source.mp4");
+    make_source(&tools, &input, 12, 1280, 720, 30);
+    let info = probe(&tools, &input).expect("source should probe");
+
+    let passlog_prefix = dir.join("pass");
+    let scale = Scale { width: 640, height: 360, fps: 30.0, bpp: 0.06, below_floor: false };
+
+    let job = |video_bps: u64, output: &Path, reusable_stats| EncodeJob {
+        input: input.clone(),
+        output: output.to_path_buf(),
+        plan: EncodePlan {
+            codec: VideoCodec::H264,
+            scale,
+            rate_control: RateControl::TwoPass { video_bps },
+            audio_bps: 96_000,
+            attempt: 1,
+        },
+        source: info.clone(),
+        speed: Speed::Fast,
+        passlog_prefix: passlog_prefix.clone(),
+        reusable_stats,
+    };
+
+    // The first attempt analyses the picture and leaves the log behind.
+    let first_out = dir.join("first.mp4");
+    let first = job(1_200_000, &first_out, None);
+    assert_eq!(first.passes(), vec![Pass::First, Pass::Second]);
+    let first_bytes = encode::run(&tools, &first, &CancelToken::new(), |_| {})
+        .expect("the first attempt should encode");
+
+    // The correction: same picture, fewer bits. It must not re-analyse.
+    let second_out = dir.join("second.mp4");
+    let second = job(400_000, &second_out, Some(first.pass_log()));
+    assert_eq!(second.passes(), vec![Pass::Second], "the analysis must be reused");
+    let second_bytes = encode::run(&tools, &second, &CancelToken::new(), |_| {})
+        .expect("a second pass alone should encode against the inherited log");
+
+    // The log was genuinely spent, not ignored: a third of the video bitrate
+    // has to show up as a substantially smaller file. Without rate control
+    // taking effect these would be the same size.
+    assert!(
+        (second_bytes as f64) < first_bytes as f64 * 0.75,
+        "reusing the log did not apply the new bitrate: {first_bytes} then {second_bytes}"
+    );
+
+    // And it is still a real video of the right length and shape.
+    let result = probe(&tools, &second_out).expect("the result should probe cleanly");
+    assert_eq!((result.width, result.height), (640, 360));
+    assert!(
+        (result.duration_secs - 12.0).abs() < 1.0,
+        "duration drifted to {}",
+        result.duration_secs
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

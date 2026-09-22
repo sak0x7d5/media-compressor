@@ -20,6 +20,23 @@ pub const DIRECT_ENCODE_THRESHOLD_SECS: f64 = 20.0;
 
 const SEGMENT_SECS: f64 = 4.0;
 
+/// How far **over** the budget a running estimate has to be before the
+/// remaining segments stop being worth encoding.
+///
+/// Only the over direction is allowed to stop early, and the asymmetry is
+/// measured rather than cautious. An estimate this far over sends the file to
+/// two-pass, which respects the cap exactly however wrong the estimate was, so
+/// the worst case is one conservative rung on the ladder.
+///
+/// Stopping early on an estimate that looks like it *fits* is a different bet
+/// entirely, and a losing one. The first slice sits a fifth of the way into the
+/// file, which in real footage is disproportionately often the calm part — an
+/// intro, a menu, a static title card. Believing it commits the job to a full
+/// CRF encode that then busts the cap and has to be re-encoded from scratch.
+/// On a 45s clip that starts static and ends busy, that trade cost 13 seconds
+/// to save 8 seconds of sampling.
+const DECISIVE_OVER_RATIO: f64 = 3.0;
+
 /// Where in the file to sample, as fractions of the duration.
 ///
 /// Not 0.0 and not 1.0: the first and last seconds of a clip are unusually
@@ -116,12 +133,39 @@ fn sample_args(
     args
 }
 
+/// Whether what has been sampled already settles the question.
+fn is_decisively_over(estimate_bytes: u64, budget_bytes: u64) -> bool {
+    budget_bytes > 0 && estimate_bytes as f64 >= budget_bytes as f64 * DECISIVE_OVER_RATIO
+}
+
+/// Scale what has been sampled so far up to the whole file.
+///
+/// Samples carry MP4 container overhead of their own, and each one starts on a
+/// fresh keyframe, so this runs a little pessimistic. That is the safe
+/// direction: it biases towards two-pass, which respects the cap exactly.
+fn extrapolate(
+    sampled_bytes: u64,
+    sampled_secs: f64,
+    plan: &EncodePlan,
+    source: &MediaInfo,
+) -> Prediction {
+    let bytes_per_second = sampled_bytes as f64 / sampled_secs;
+    let video_bytes = (bytes_per_second * source.duration_secs).round() as u64;
+    let audio_bytes = (plan.audio_bps as f64 * source.duration_secs / 8.0).round() as u64;
+
+    Prediction { video_bytes, total_bytes: video_bytes + audio_bytes, sampled_secs }
+}
+
 /// Encode a few slices of the file and extrapolate.
+///
+/// Stops early once the estimate is far enough over `budget_bytes` that the
+/// remaining slices could not change the plan.
 pub fn predict(
     tools: &FfmpegTools,
     input: &Path,
     plan: &EncodePlan,
     source: &MediaInfo,
+    budget_bytes: u64,
     speed: Speed,
     work_dir: &Path,
     cancel: &CancelToken,
@@ -154,24 +198,24 @@ pub fn predict(
             total_bytes += size;
             sampled_secs += length;
         }
+
+        // A file that busts the cap by this much is decided by the first slice,
+        // and this is the common case — the clips people bring to a size
+        // targeting tool are usually far too big rather than marginally so.
+        // Encoding the rest of the slices only says so more precisely.
+        if sampled_secs > 0.0 {
+            let running = extrapolate(total_bytes, sampled_secs, plan, source);
+            if is_decisively_over(running.total_bytes, budget_bytes) {
+                break;
+            }
+        }
     }
 
     if sampled_secs <= 0.0 {
         return Err(EncodeError::NoOutput);
     }
 
-    // Samples carry MP4 container overhead of their own, and each one starts on
-    // a fresh keyframe, so this runs a little pessimistic. That is the safe
-    // direction: it biases towards two-pass, which respects the cap exactly.
-    let bytes_per_second = total_bytes as f64 / sampled_secs;
-    let video_bytes = (bytes_per_second * source.duration_secs).round() as u64;
-    let audio_bytes = (plan.audio_bps as f64 * source.duration_secs / 8.0).round() as u64;
-
-    Ok(Prediction {
-        video_bytes,
-        total_bytes: video_bytes + audio_bytes,
-        sampled_secs,
-    })
+    Ok(extrapolate(total_bytes, sampled_secs, plan, source))
 }
 
 /// Run an FFmpeg command we do not need progress from.
@@ -222,6 +266,93 @@ pub fn work_file(work_dir: &Path, stem: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strategy::ladder::Scale;
+    use crate::strategy::VideoCodec;
+
+    fn plan(audio_bps: u32) -> EncodePlan {
+        EncodePlan {
+            codec: VideoCodec::H264,
+            scale: Scale { width: 1920, height: 1080, fps: 60.0, bpp: 0.06, below_floor: false },
+            rate_control: RateControl::Crf { crf: 23 },
+            audio_bps,
+            attempt: 1,
+        }
+    }
+
+    fn info(duration_secs: f64) -> MediaInfo {
+        MediaInfo { duration_secs, width: 1920, height: 1080, fps: 60.0, audio: None }
+    }
+
+    #[test]
+    fn an_estimate_far_over_the_budget_settles_the_question() {
+        let budget = 10_000_000;
+
+        assert!(is_decisively_over(40_000_000, budget), "four times over is not a close call");
+        assert!(is_decisively_over(30_000_000, budget), "exactly at the ratio counts");
+    }
+
+    #[test]
+    fn an_estimate_near_the_budget_does_not() {
+        let budget = 10_000_000;
+
+        // Here the remaining segments earn their encoding time, because a
+        // little variance flips the decision.
+        for estimate in [9_000_000, 10_000_000, 11_000_000, 20_000_000] {
+            assert!(
+                !is_decisively_over(estimate, budget),
+                "{estimate} against {budget} should still be sampled further"
+            );
+        }
+    }
+
+    /// The asymmetry that matters, and the one this originally got wrong.
+    ///
+    /// A first slice that looks comfortably under budget is not evidence the
+    /// file fits — it is usually evidence the file opens on something static.
+    /// Acting on it costs a whole wasted CRF encode plus the correction, which
+    /// is far more than the two slices it would save.
+    #[test]
+    fn an_estimate_that_merely_looks_like_it_fits_is_never_decisive() {
+        let budget = 10_000_000;
+
+        for estimate in [5_000_000, 1_000_000, 100_000, 0] {
+            assert!(
+                !is_decisively_over(estimate, budget),
+                "{estimate} against {budget} must not cut sampling short"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_budget_is_never_decisive() {
+        // `budget::compute` refuses the impossible targets, but a division by
+        // zero here would be a much worse way to find that out.
+        assert!(!is_decisively_over(5_000_000, 0));
+    }
+
+    #[test]
+    fn stopping_early_does_not_change_the_estimate() {
+        // The early-out only skips segments; it must not bias the number the
+        // remaining ones produce. Same bytes per second, different amounts
+        // sampled, same answer.
+        let one_segment = extrapolate(4_000_000, 4.0, &plan(0), &info(120.0));
+        let three_segments = extrapolate(12_000_000, 12.0, &plan(0), &info(120.0));
+
+        assert_eq!(one_segment.total_bytes, three_segments.total_bytes);
+        assert_eq!(one_segment.total_bytes, 120_000_000);
+        assert_eq!(one_segment.sampled_secs, 4.0);
+    }
+
+    #[test]
+    fn the_estimate_counts_audio_the_samples_never_encoded() {
+        // Samples run with `-an`, so the audio track has to be added back or a
+        // file that only just fits would be predicted to fit comfortably.
+        let silent = extrapolate(4_000_000, 4.0, &plan(0), &info(120.0));
+        let with_audio = extrapolate(4_000_000, 4.0, &plan(128_000), &info(120.0));
+
+        assert_eq!(with_audio.video_bytes, silent.video_bytes);
+        assert_eq!(with_audio.total_bytes - silent.total_bytes, 128_000 * 120 / 8);
+    }
 
     #[test]
     fn three_segments_are_spread_through_the_file() {

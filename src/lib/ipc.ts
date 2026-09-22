@@ -6,6 +6,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 export const EVENT_JOB = 'job';
 export const EVENT_INSTALL = 'ffmpeg-install';
 export const EVENT_OPEN_FILES = 'open-files';
+export const EVENT_UPDATE = 'update-progress';
 
 export interface Preset {
 	id: string;
@@ -41,12 +42,23 @@ export interface SystemBuild {
 	missing_encoders: string[];
 }
 
+/**
+ * What a launch was asked to do. `target_bytes` is set when the user picked a
+ * size straight from the Explorer submenu instead of opening the app cold.
+ */
+export interface Launch {
+	files: string[];
+	target_bytes: number | null;
+}
+
 /** Everything the first frame needs, fetched in one round trip. */
 export interface Startup {
 	ffmpeg: FfmpegStatus;
 	presets: PresetFile;
-	/** Paths this launch was handed on the command line. */
-	pending_files: string[];
+	/** What this launch was handed on the command line. */
+	launch: Launch;
+	/** Whether the Explorer right-click entry can be offered on this platform. */
+	shell_supported: boolean;
 }
 
 export interface MediaInfo {
@@ -174,6 +186,24 @@ export type Disposition = 'keep' | 'replace';
  */
 export type OutputMode = 'beside' | 'folder' | 'ask' | 'replace';
 
+/**
+ * The Explorer right-click entry. `supported` is false off Windows, where the
+ * control is hidden rather than shown as a switch that can only fail.
+ */
+export interface ShellMenuStatus {
+	supported: boolean;
+	enabled: boolean;
+}
+
+/**
+ * What a launch was asked to do. `target_bytes` is set when the user picked a
+ * size straight from the Explorer submenu instead of opening the app cold.
+ */
+export interface Launch {
+	files: string[];
+	target_bytes: number | null;
+}
+
 export interface QueuedFile {
 	id: string;
 	input: string;
@@ -183,12 +213,25 @@ export interface QueuedFile {
 	replaces_input: boolean;
 }
 
+/** The queue as a whole — what the Stop / Resume / Clear controls are about. */
+export interface QueueStatus {
+	paused: boolean;
+	/** Jobs waiting for the worker. */
+	waiting: number;
+	running: boolean;
+}
+
 export interface UpdateInfo {
 	version: string;
 	current_version: string;
 	notes: string | null;
 	date: string | null;
 }
+
+/** How far an install has got. `installing` is often the last thing heard. */
+export type UpdateProgress =
+	| { step: 'downloading'; received_bytes: number; total_bytes: number | null }
+	| { step: 'installing' };
 
 export interface PreviewPair {
 	before: string;
@@ -205,6 +248,30 @@ export const startup = () => invoke<Startup>('startup');
  * including the failing ones.
  */
 export const uiReady = () => invoke<void>('ui_ready');
+
+/** A group of changelog items — "Added", "Fixed". */
+export interface ChangeSection {
+	heading: string;
+	items: string[];
+}
+
+export interface Release {
+	version: string;
+	date?: string | null;
+	sections: ChangeSection[];
+}
+
+/** Changelog entries this profile has not been shown yet. */
+export interface WhatsNew {
+	from: string | null;
+	current: string;
+	releases: Release[];
+}
+
+export interface UpdatePrefs {
+	last_seen_version?: string | null;
+	auto_check: boolean;
+}
 
 export const listPresets = () => invoke<PresetFile>('list_presets');
 export const savePresets = (presets: PresetFile) => invoke<void>('save_presets', { presets });
@@ -229,7 +296,11 @@ export const probeFile = (path: string) => invoke<MediaInfo>('probe_file', { pat
 export const addFiles = (paths: string[], settings: EncodeSettings) =>
 	invoke<QueuedFile[]>('add_files', { paths, settings });
 export const cancelJob = (id: string) => invoke<void>('cancel_job', { id });
-export const cancelAll = () => invoke<void>('cancel_all');
+/** Throw the queue away. */
+export const cancelAll = () => invoke<QueueStatus>('cancel_all');
+/** Stop working, keeping the queue. The running file goes back in the queue. */
+export const pauseQueue = () => invoke<QueueStatus>('pause_queue');
+export const resumeQueue = () => invoke<QueueStatus>('resume_queue');
 export const copyToClipboard = (paths: string[]) => invoke<void>('copy_to_clipboard', { paths });
 export const revealInFolder = (path: string) => invoke<void>('reveal_in_folder', { path });
 
@@ -242,16 +313,26 @@ export const refreshPresets = (force = false) =>
 export const checkForUpdate = () => invoke<UpdateInfo | null>('check_for_update');
 export const installUpdate = () => invoke<void>('install_update');
 
+export const whatsNew = () => invoke<WhatsNew | null>('whats_new');
+export const dismissWhatsNew = () => invoke<void>('dismiss_whats_new');
+export const changelog = () => invoke<Release[]>('changelog');
+export const updatePrefs = () => invoke<UpdatePrefs>('update_prefs');
+export const setAutoCheck = (enabled: boolean) =>
+	invoke<UpdatePrefs>('set_auto_check', { enabled });
 export const previewPair = (before: string, after: string, atSeconds?: number) =>
 	invoke<PreviewPair>('preview_pair', { before, after, atSeconds });
-export const shellMenuStatus = () => invoke<boolean>('shell_menu_status');
-export const setShellMenu = (enabled: boolean) => invoke<boolean>('set_shell_menu', { enabled });
+export const shellMenuStatus = () => invoke<ShellMenuStatus>('shell_menu_status');
+export const setShellMenu = (enabled: boolean) =>
+	invoke<ShellMenuStatus>('set_shell_menu', { enabled });
 
-export const onOpenFiles = (handler: (paths: string[]) => void): Promise<UnlistenFn> =>
-	listen<string[]>(EVENT_OPEN_FILES, (message) => handler(message.payload));
+export const onOpenFiles = (handler: (launch: Launch) => void): Promise<UnlistenFn> =>
+	listen<Launch>(EVENT_OPEN_FILES, (message) => handler(message.payload));
 
 export const onJobEvent = (handler: (event: JobEvent) => void): Promise<UnlistenFn> =>
 	listen<JobEvent>(EVENT_JOB, (message) => handler(message.payload));
 
 export const onInstallProgress = (handler: (event: InstallProgress) => void): Promise<UnlistenFn> =>
 	listen<InstallProgress>(EVENT_INSTALL, (message) => handler(message.payload));
+
+export const onUpdateProgress = (handler: (event: UpdateProgress) => void): Promise<UnlistenFn> =>
+	listen<UpdateProgress>(EVENT_UPDATE, (message) => handler(message.payload));

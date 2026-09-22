@@ -2,8 +2,10 @@
 	import type { Job } from '$lib/jobs.svelte';
 	import { formatPercent } from '$lib/format';
 
-	let { job, onCancel, onRemove, onSelect, onCopy }: {
+	let { job, paused = false, onCancel, onRemove, onSelect, onCopy }: {
 		job: Job;
+		/** Whether the queue as a whole is stopped. */
+		paused?: boolean;
 		onCancel: (id: string) => void;
 		onRemove: (id: string) => void;
 		onSelect: (id: string) => void;
@@ -14,6 +16,12 @@
 	const settled = $derived(job.state === 'done' || job.state === 'failed' || job.state === 'cancelled');
 	/* Only a finished job has a result worth opening. */
 	const selectable = $derived(job.state === 'done');
+
+	/* A stopped queue must not leave rows saying "queued", which reads as "your
+	   turn is coming" when nothing is going to happen until Resume. */
+	const label = $derived(
+		job.state === 'done' ? '✓' : paused && job.state === 'queued' ? 'paused' : job.status
+	);
 
 	const statusColor = $derived(
 		job.state === 'done'
@@ -63,9 +71,7 @@
 	<!-- Once the size line reads "312 MB -> 19.2 MB", the word "done" adds
 	     nothing, so a finished row gets a tick and the space goes to the
 	     actions. Every other state still needs its word. -->
-	<div class="status" style:color={statusColor}>
-		{job.state === 'done' ? '✓' : job.status}
-	</div>
+	<div class="status" style:color={statusColor}>{label}</div>
 
 	<div class="trailing">
 		{#if running}

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { getVersion } from '@tauri-apps/api/app';
 	import { getCurrentWebview } from '@tauri-apps/api/webview';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import type { UnlistenFn } from '@tauri-apps/api/event';
@@ -11,43 +12,84 @@
 	import ResultCard from '$lib/components/ResultCard.svelte';
 	import Settings from '$lib/components/Settings.svelte';
 	import TargetPicker from '$lib/components/TargetPicker.svelte';
+	import UpdateBar from '$lib/components/UpdateBar.svelte';
+	import WhatsNew from '$lib/components/WhatsNew.svelte';
 
-	import { JobList } from '$lib/jobs.svelte';
+	import { JobList, type Job } from '$lib/jobs.svelte';
+	import { Updater } from '$lib/updates.svelte';
 	import { formatBytes } from '$lib/format';
 	import {
 		addFiles,
 		cancelAll,
 		cancelJob,
+		changelog,
 		copyToClipboard,
+		dismissWhatsNew,
 		installFfmpeg,
 		onInstallProgress,
 		onJobEvent,
 		onOpenFiles,
+		pauseQueue,
 		previewPair,
+		resumeQueue,
 		revealInFolder,
+		setAutoCheck,
+		setShellMenu,
 		startup,
 		systemFfmpeg,
 		useSystemFfmpeg,
 		uiReady,
+		updatePrefs,
+		whatsNew,
 		type EncodeSettings,
+		type Launch,
 		type FfmpegStatus,
 		type InstallProgress,
 		type OutputMode,
 		type PresetFile,
 		type PreviewPair,
-		type SystemBuild
+		type Release,
+		type SystemBuild,
+		type UpdatePrefs
 	} from '$lib/ipc';
 
 	const CUSTOM = '__custom__';
-	/* Must stay in step with EXTENSIONS in shell_integration.rs: anything the
+	/* Must stay a superset of EXTENSIONS in shell_integration.rs: anything the
 	   Explorer menu offers has to be accepted here, or right-clicking a file the
-	   app itself advertised ends in "that file type is not supported". */
+	   app itself advertised ends in "that file type is not supported".
+
+	   It keeps 'ts' even though the Explorer menu drops it: dragging a file in
+	   or picking it from the browse dialog is a deliberate choice about that one
+	   file, so a TypeScript source can never turn up here unasked the way a
+	   registered .ts menu entry turns up on every source file on the machine. */
 	const MEDIA_EXTENSIONS = [
 		'mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v', 'wmv', 'flv', 'mpg', 'mpeg', 'ts', 'gif',
 		'png', 'jpg', 'jpeg', 'webp', 'avif', 'bmp', 'tif', 'tiff'
 	];
 
+	/** How long to leave the window alone before asking about updates. Long
+	    enough that a launch which arrived with a file to compress is already
+	    encoding, short enough that nobody has closed the app yet. */
+	const UPDATE_CHECK_DELAY_MS = 4000;
+
 	const jobs = new JobList();
+	const updater = new Updater();
+	let checkTimer: ReturnType<typeof setTimeout> | undefined;
+
+	let version = $state('');
+	let prefs = $state<UpdatePrefs | null>(null);
+
+	/** The release-notes panel: the greeting after an update, or the full
+	    history when asked for from Settings. */
+	type NotesView = {
+		title: string;
+		subtitle?: string;
+		releases: Release[];
+		dismissLabel: string;
+		/** Closing it records the version as seen. Only the greeting does. */
+		acknowledge: boolean;
+	};
+	let notes = $state<NotesView | null>(null);
 
 	let status = $state<FfmpegStatus | null>(null);
 	/* Only consulted when there is nothing installed, to explain why an FFmpeg
@@ -67,6 +109,7 @@
 	let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
 	let showSettings = $state(false);
+	let shellSupported = $state(false);
 
 	/* Where results go. "beside" writes next to the original, which is the
 	   default and needs no folder at all. */
@@ -78,6 +121,20 @@
 	let outputDir = $state<string | null>(null);
 	let preview = $state<PreviewPair | null>(null);
 	let previewBusy = $state(false);
+	/* The clip the open comparison came from, kept so that scrubbing can go
+	   back to the same two files without depending on the job still being
+	   the one on screen. Duration is zero for a still, which has no
+	   timeline. */
+	let previewSource = $state<{ input: string; output: string; duration: number } | null>(null);
+	let previewSeeking = $state(false);
+	let seekToken = 0;
+	let seekTimer: ReturnType<typeof setTimeout> | undefined;
+	/* Frames already pulled for the open comparison. Going back and forth
+	   between two moments is how this gets used, and the second visit
+	   should not pay ffmpeg again. Bounded because each entry is two
+	   base64 frames. */
+	const SEEK_CACHE_LIMIT = 16;
+	let seekCache = new Map<string, PreviewPair>();
 
 	let options = $state<Omit<EncodeSettings, 'target_bytes'>>({
 		safety_margin: 0.95,
@@ -95,6 +152,11 @@
 
 	const settings = $derived<EncodeSettings>({ ...options, target_bytes: limitBytes });
 	const soleResult = $derived(jobs.soleResult);
+
+	/* Stopping keeps the queue, so the footer has to distinguish "nothing left
+	   to do" from "plenty left, deliberately not doing it". */
+	let paused = $state(false);
+	const hasWork = $derived(jobs.hasWork);
 
 	/* A finished row can be opened to get the same result card a single file
 	   gets. Only finished jobs have a result to show, and the selection is
@@ -148,6 +210,11 @@
 
 		preview = null;
 		openJobId = null;
+		// Work arriving beats anything being read. Closing the greeting here
+		// counts as having seen it — showing it again next launch, to someone
+		// who moved on to compressing a file, is nagging.
+		if (notes) closeNotes();
+
 		try {
 			jobs.add(
 				await addFiles(media, {
@@ -156,9 +223,53 @@
 					disposition: replacing ? 'replace' : 'keep'
 				})
 			);
+			// Adding work restarts a stopped queue, backend included. Mirroring
+			// it here rather than asking keeps the footer honest immediately.
+			paused = false;
 		} catch (error) {
 			flash(String(error));
 		}
+	}
+
+	/**
+	 * Act on a launch: adopt the size the Explorer submenu asked for, then queue
+	 * its files. The size is applied first so the jobs are created against it
+	 * rather than against whatever the picker happened to be showing.
+	 */
+	async function open_(launch: Launch) {
+		if (launch.files.length === 0) return;
+
+		if (launch.target_bytes !== null) {
+			// Prefer the preset that names this size, so the picker reads
+			// "Discord Free" rather than a bare custom number.
+			const match = presets?.presets.find((preset) => preset.bytes === launch.target_bytes);
+			selectedId = match ? match.id : CUSTOM;
+			customBytes = launch.target_bytes;
+		}
+
+		await enqueue(launch.files);
+	}
+
+	/** Stop, keeping the queue. The file being encoded goes back in the queue. */
+	async function stop() {
+		paused = (await pauseQueue()).paused;
+	}
+
+	async function resume() {
+		paused = (await resumeQueue()).paused;
+	}
+
+	/**
+	 * Empty the list.
+	 *
+	 * Anything still queued has to be cancelled in the backend too, or the rows
+	 * would vanish while the encoder carried on working through them.
+	 */
+	async function clearList() {
+		paused = (await cancelAll()).paused;
+		jobs.clear();
+		openJobId = null;
+		preview = null;
 	}
 
 	async function browse() {
@@ -170,28 +281,47 @@
 		await enqueue(Array.isArray(chosen) ? chosen : [chosen]);
 	}
 
-	async function install() {
+	async function install(addToExplorerMenu: boolean) {
 		installing = true;
 		installError = null;
 		try {
 			status = await installFfmpeg();
 		} catch (error) {
 			installError = String(error);
+			return;
 		} finally {
 			installing = false;
 		}
+		await addShellMenuIfWanted(addToExplorerMenu);
 	}
 
 	/** Offered only when startup found a usable build but stopped waiting on it. */
-	async function adoptSystem() {
+	async function adoptSystem(addToExplorerMenu: boolean) {
 		installing = true;
 		installError = null;
 		try {
 			status = await useSystemFfmpeg();
 		} catch (error) {
 			installError = String(error);
+			return;
 		} finally {
 			installing = false;
+		}
+		await addShellMenuIfWanted(addToExplorerMenu);
+	}
+
+	/**
+	 * Deliberately after FFmpeg is installed and verified, whichever way it
+	 * arrived. A right-click entry that opens an app which can't compress
+	 * anything is worse than no entry at all.
+	 */
+	async function addShellMenuIfWanted(wanted: boolean) {
+		if (!wanted || !shellSupported) return;
+		try {
+			await setShellMenu(true);
+		} catch {
+			// Never fail the install over this — it's undoable and retryable.
+			flash('Could not add the right-click entry. You can retry it in Settings.');
 		}
 	}
 
@@ -215,14 +345,105 @@
 		}
 	}
 
-	async function compare(input: string, output: string) {
+	async function compare(job: Job) {
 		previewBusy = true;
+		seekCache = new Map();
 		try {
-			preview = await previewPair(input, output);
+			preview = await previewPair(job.input, job.output);
+			previewSource = {
+				input: job.input,
+				output: job.output,
+				duration: job.outcome?.kind === 'video' ? job.outcome.info.duration_secs : 0
+			};
 		} catch (error) {
 			flash(String(error));
 		} finally {
 			previewBusy = false;
+		}
+	}
+
+	/**
+	 * Move the comparison to another moment in the clip.
+	 *
+	 * Each seek is two ffmpeg runs against files on disk, so it waits for the
+	 * drag to settle rather than firing per pixel — a swap mid-drag is a frame
+	 * nobody looks at anyway.
+	 */
+	function seekPreview(seconds: number, immediate = false) {
+		clearTimeout(seekTimer);
+
+		/* A frame already in hand is not worth a round trip, or the debounce
+		   that exists to protect one. */
+		const cached = seekCache.get(seconds.toFixed(1));
+		if (cached) {
+			seekToken++;
+			preview = cached;
+			previewSeeking = false;
+			return;
+		}
+
+		if (previewSource) previewSeeking = true;
+		if (immediate) void runSeek(seconds);
+		else seekTimer = setTimeout(() => void runSeek(seconds), 150);
+	}
+
+	/* Replies can land out of order, so a stale one is dropped rather than
+	   allowed to paint over a newer frame. */
+	async function runSeek(seconds: number) {
+		const source = previewSource;
+		if (!source) {
+			previewSeeking = false;
+			return;
+		}
+
+		const token = ++seekToken;
+		previewSeeking = true;
+		try {
+			const pair = await previewPair(source.input, source.output, seconds);
+			seekCache.set(seconds.toFixed(1), pair);
+			// Oldest first, so deleting from the front drops the least recent.
+			if (seekCache.size > SEEK_CACHE_LIMIT) {
+				seekCache.delete(seekCache.keys().next().value as string);
+			}
+			if (token === seekToken) preview = pair;
+		} catch (error) {
+			if (token === seekToken) flash(String(error));
+		} finally {
+			if (token === seekToken) previewSeeking = false;
+		}
+	}
+
+	function closePreview() {
+		clearTimeout(seekTimer);
+		seekCache = new Map();
+		seekToken++;
+		preview = null;
+		previewSource = null;
+		previewSeeking = false;
+	}
+
+	function closeNotes() {
+		// Only the post-update greeting moves the bookmark; browsing the history
+		// from Settings must not swallow notes the user has not been shown.
+		if (notes?.acknowledge) void dismissWhatsNew();
+		notes = null;
+	}
+
+	async function showReleaseNotes() {
+		try {
+			const releases = await changelog();
+			showSettings = false;
+			notes = { title: 'Release notes', releases, dismissLabel: 'Close', acknowledge: false };
+		} catch (error) {
+			flash(String(error));
+		}
+	}
+
+	async function toggleAutoCheck(enabled: boolean) {
+		try {
+			prefs = await setAutoCheck(enabled);
+		} catch (error) {
+			flash(String(error));
 		}
 	}
 
@@ -235,13 +456,15 @@
 	 * with a window, and one that answered must not be shown mid-populate.
 	 */
 	async function boot() {
-		let launchedWith: string[] = [];
+		let launchedWith: Launch | null = null;
 
 		try {
 			const initial = await startup();
 			status = initial.ffmpeg;
 			presets = initial.presets;
-			launchedWith = initial.pending_files;
+			launchedWith = initial.launch;
+
+			shellSupported = initial.shell_supported;
 
 			const fallback = presets.presets.find((preset) => preset.default) ?? presets.presets[0];
 			if (fallback) {
@@ -268,7 +491,34 @@
 		// Files handed to us on the command line — the Explorer context menu
 		// path for a cold start. Queued after the reveal so a folder prompt has
 		// a window to sit in front of.
-		if (launchedWith.length > 0) await enqueue(launchedWith);
+		if (launchedWith) await open_(launchedWith);
+
+		version = await getVersion();
+
+		// A launch that arrived with work to do is not the moment for release
+		// notes; the panel would cover the queue it was asked to run.
+		if (!launchedWith || launchedWith.files.length === 0) {
+			const news = await whatsNew();
+			if (news && news.releases.length > 0) {
+				notes = {
+					title: `What's new in ${news.current}`,
+					subtitle: news.from ? `Updated from ${news.from}.` : undefined,
+					releases: news.releases,
+					dismissLabel: 'Got it',
+					acknowledge: true
+				};
+			}
+		}
+
+		prefs = await updatePrefs();
+		// Never in a dev session. `pnpm tauri dev` runs from source, and an
+		// updater that decided the published release was newer would install
+		// a bundled copy over the top of what you are editing. Settings'
+		// "Check now" still works, so the path stays testable on purpose
+		// rather than by accident.
+		if (prefs.auto_check && !import.meta.env.DEV) {
+			checkTimer = setTimeout(() => void updater.check(), UPDATE_CHECK_DELAY_MS);
+		}
 	}
 
 	onMount(() => {
@@ -277,7 +527,7 @@
 		unlisteners.push(onJobEvent((event) => jobs.apply(event)));
 		unlisteners.push(onInstallProgress((event) => (installProgress = event)));
 		// A second launch forwards its files here rather than opening a window.
-		unlisteners.push(onOpenFiles((paths) => void enqueue(paths)));
+		unlisteners.push(onOpenFiles((launch) => void open_(launch)));
 
 		// Tauri delivers OS drag-and-drop to the webview rather than as DOM
 		// events, so the browser's own dragover/drop never fire here.
@@ -296,6 +546,7 @@
 
 		return () => {
 			clearTimeout(toastTimer);
+			clearTimeout(checkTimer);
 			for (const pending of unlisteners) {
 				void pending.then((unlisten) => unlisten());
 			}
@@ -310,10 +561,15 @@
 			error={installError}
 			busy={installing}
 			system={systemBuild}
+			{shellSupported}
 			onInstall={install}
 			onUseSystem={adoptSystem}
 		/>
 	{:else}
+		{#if updater.offering}
+			<UpdateBar {updater} blocked={hasWork} onDismiss={() => updater.dismiss()} />
+		{/if}
+
 		<header>
 			<span class="count">
 				{jobs.jobs.length === 0
@@ -342,13 +598,14 @@
 
 		<section
 			class="body"
-			class:empty={jobs.jobs.length === 0 && !showSettings}
+			class:empty={jobs.jobs.length === 0 && !showSettings && !notes}
 			class:fill={Boolean(preview) && !showSettings}
 		>
 			{#if showSettings}
 				<Settings
 					settings={{ ...options, target_bytes: limitBytes }}
 					{status}
+					{shellSupported}
 					presetsSourceUrl={presets?.source_url ?? ''}
 					{outputMode}
 					{outputDir}
@@ -356,13 +613,32 @@
 						outputMode = mode;
 						outputDir = dir;
 					}}
+					appVersion={version}
+					{updater}
+					autoCheck={prefs?.auto_check ?? true}
 					onChange={(patch) => (options = { ...options, ...patch })}
 					onPresets={(next) => (presets = next)}
 					onFfmpeg={(next) => (status = next)}
+					onAutoCheck={(enabled) => void toggleAutoCheck(enabled)}
+					onReleaseNotes={() => void showReleaseNotes()}
 					onClose={() => (showSettings = false)}
 				/>
+			{:else if notes}
+				<WhatsNew
+					title={notes.title}
+					subtitle={notes.subtitle}
+					releases={notes.releases}
+					dismissLabel={notes.dismissLabel}
+					onClose={closeNotes}
+				/>
 			{:else if preview}
-				<ComparePreview pair={preview} onClose={() => (preview = null)} />
+				<ComparePreview
+					pair={preview}
+					duration={previewSource?.duration ?? 0}
+					seeking={previewSeeking}
+					onSeek={seekPreview}
+					onClose={closePreview}
+				/>
 			{:else if detailJob}
 				<ResultCard
 					job={detailJob}
@@ -370,7 +646,7 @@
 					busy={previewBusy}
 					onCopy={copy}
 					onReveal={(path) => void revealInFolder(path)}
-					onCompare={() => compare(detailJob.input, detailJob.output)}
+					onCompare={() => compare(detailJob)}
 					onClear={() => {
 						jobs.remove(detailJob.id);
 						openJobId = null;
@@ -384,6 +660,7 @@
 					{#each jobs.jobs as job (job.id)}
 						<FileRow
 							{job}
+							{paused}
 							onCancel={(id) => void cancelJob(id)}
 							onRemove={(id) => {
 								jobs.remove(id);
@@ -399,7 +676,9 @@
 
 		<footer>
 			<span class="summary">
-				{#if jobs.anyRunning}
+				{#if hasWork && paused}
+					stopped · {jobs.waiting.length} waiting
+				{:else if hasWork}
 					encoding · target {formatBytes(limitBytes)}
 				{:else if jobs.finished.length > 0}
 					{jobs.finished.length} done · target {formatBytes(limitBytes)}
@@ -415,10 +694,18 @@
 				<button onclick={copyAllFinished}>Copy all</button>
 			{/if}
 
-			{#if jobs.anyRunning}
-				<button onclick={() => void cancelAll()}>Stop</button>
-			{:else if jobs.jobs.length > 0}
-				<button onclick={() => jobs.clear()}>Clear</button>
+			<!-- Stop is a pause, so it has to come back as Resume — and Clear has
+			     to be reachable next to it, or a stopped queue would be a state
+			     with no way out but dismissing every row by hand. -->
+			{#if hasWork && !paused}
+				<button onclick={() => void stop()}>Stop</button>
+			{:else}
+				{#if hasWork}
+					<button onclick={() => void resume()}>Resume</button>
+				{/if}
+				{#if jobs.jobs.length > 0}
+					<button onclick={() => void clearList()}>Clear</button>
+				{/if}
 			{/if}
 
 			<button class="primary" onclick={browse}>Add files</button>

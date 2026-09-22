@@ -126,7 +126,7 @@ pub fn compress_media(
     let result = run_media(tools, request, cancel, on_stage);
 
     if result.is_err() && !pre_existing {
-        let _ = std::fs::remove_file(&request.output);
+        discard_partial(&request.output);
     }
 
     result
@@ -194,6 +194,7 @@ fn run(
             &request.input,
             &optimistic,
             &info,
+            context.budget.total_bytes,
             request.speed,
             &request.work_dir,
             cancel,
@@ -214,6 +215,11 @@ fn run(
     on_stage(Stage::Planned { plan: plan.clone(), predicted_bytes: predicted });
 
     let mut output_bytes;
+    // What the statistics files in the work directory describe, once some
+    // attempt has written them. A correction that keeps the same picture spends
+    // them instead of recomputing them, which halves its cost.
+    let mut stats = None;
+
     loop {
         let job = EncodeJob {
             input: request.input.clone(),
@@ -222,11 +228,17 @@ fn run(
             source: info.clone(),
             speed: request.speed,
             passlog_prefix: request.work_dir.join("pass"),
+            reusable_stats: stats,
         };
 
         output_bytes = encode::run(tools, &job, cancel, |progress| {
             on_stage(Stage::Encoding(progress));
         })?;
+
+        // Only a two-pass attempt leaves an analysis behind; a CRF one never
+        // writes the log at all, so there is nothing for the next attempt to
+        // inherit.
+        stats = plan.is_two_pass().then(|| job.pass_log());
 
         match context.correct(&plan, output_bytes) {
             Some(corrected) => {
@@ -260,6 +272,50 @@ fn clean_work_dir(dir: &Path) {
     let _ = std::fs::remove_dir(dir);
 }
 
+/// Remove a result that was never finished.
+///
+/// A killed FFmpeg leaves whatever it had muxed so far sitting at the
+/// destination, and an image search writes every candidate straight there.
+/// Left in place it looks like a finished file — and the next run would step
+/// around it with a "(compressed 2)" name, so every stopped job would litter
+/// the folder it was meant to tidy. The caller has checked that nothing
+/// occupied the path before this run, so deleting it can only lose work we
+/// abandoned ourselves.
+///
+/// This also runs when the encode had in fact just finished as the stop landed:
+/// the job was reported cancelled, so it must leave nothing behind. A file with
+/// no row explaining it is worse than no file.
+///
+/// The retry is not superstition, and the budget is not guesswork. The first
+/// attempt fails every single time: Windows still has the file open when the
+/// process that held it has already been killed and reaped. It frees within
+/// ~50ms once the machine is quiet, but a virus scanner reading a freshly
+/// written video holds it far longer — over a second, measured, with several
+/// encodes finishing at once.
+///
+/// So this blocks the worker rather than cleaning up in the background. An
+/// asynchronous delete could still be waiting for the handle when a *resumed*
+/// job reopens the same path, and would then delete the file that job was busy
+/// writing. Seconds of delay on a cancel are cheap; deleting a good result is
+/// not.
+fn discard_partial(output: &Path) {
+    const ATTEMPTS: u32 = 50;
+    const BETWEEN: std::time::Duration = std::time::Duration::from_millis(100);
+
+    for attempt in 0..ATTEMPTS {
+        match std::fs::remove_file(output) {
+            Ok(()) => return,
+            // Nothing had been written yet — the usual case for a job stopped
+            // while it was still sampling.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) if attempt + 1 < ATTEMPTS => std::thread::sleep(BETWEEN),
+            // Out of patience. A file we could not delete is not worth failing
+            // an already-cancelled job over.
+            Err(_) => return,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +336,25 @@ mod tests {
     #[test]
     fn cleaning_a_missing_work_dir_is_not_an_error() {
         clean_work_dir(Path::new("this-directory-does-not-exist-anywhere"));
+    }
+
+    #[test]
+    fn a_partial_result_is_removed_and_a_missing_one_is_not_an_error() {
+        let dir = std::env::temp_dir()
+            .join("media-compressor-tests")
+            .join(format!("partial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let output = dir.join("clip (compressed).mp4");
+        std::fs::write(&output, b"half an mp4").unwrap();
+
+        discard_partial(&output);
+        assert!(!output.exists(), "a stopped encode must not leave its output behind");
+
+        // Nothing was written before the stop — the common case for a job
+        // cancelled while it was still sampling.
+        discard_partial(&output);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

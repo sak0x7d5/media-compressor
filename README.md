@@ -188,6 +188,67 @@ A format change replaces across the extension: compressing `clip.mov` leaves
 `clip.mp4` and no `clip.mov`. Comparing before and after is unavailable for a
 replaced file, because there is no longer a "before" to read.
 
+## Explorer right-click
+
+Offered as a ticked checkbox on the first-run screen, and toggleable afterwards
+under Settings → Explorer right-click. It puts a **Shrink** cascade on videos
+and images:
+
+```
+Shrink  >   Discord Free · 20.0 MB
+            Discord      >   Free · 20.0 MB
+            Email        >   Gmail attachment · 25.0 MB
+            Messaging    >   ...
+            Choose a size…
+```
+
+Not "Compress": Windows 11 already puts its own **Compress to...** — which
+makes a ZIP — in the same menu, and two neighbouring entries opening with the
+same verb is a coin flip for the reader.
+
+The submenu is generated from the preset list rather than hardcoded, so editing
+a size in Settings or picking one up from a remote refresh rewrites the menu to
+match. The default preset is promoted to the top level so the common case is two
+clicks; the last entry opens the app without choosing a size. Each entry passes
+`--target <bytes>`, and a value that fails to parse or is implausible as an
+upload limit is ignored rather than fatal — you still get your files, just at the
+default size.
+
+Registration writes under `HKEY_CURRENT_USER\Software\Classes`, so it needs no
+administrator rights and touches no other account on the machine. It attaches
+per extension rather than to `*`, which keeps the entry off every text file and
+spreadsheet, and it hangs off `SystemFileAssociations` rather than a ProgID so
+it survives the user changing their default video player. Selecting a dozen
+clips invokes the app once with all twelve rather than opening twelve copies.
+
+All twenty extensions point at **one** shared definition of the submenu through
+`ExtendedSubCommandsKey`, so adding a preset rewrites a single key rather than
+twenty copies of the same tree. Nesting uses an empty `SubCommands` plus a
+`shell` subkey, which keeps the whole thing per-user; a semicolon-separated
+list there would instead resolve against the machine-wide `CommandStore`, which
+needs administrator rights.
+
+**On Windows 11 the entry appears under "Show more options"**, not in the short
+menu that opens first. Nothing about the registry can change that: the short
+menu only lists `IExplorerCommand` handlers shipped in a signed MSIX package.
+It is the same reason 7-Zip's entry lives down there.
+
+`register` and `unregister` are exact inverses, and both trees are rebuilt from
+scratch on every registration rather than merged into — a shrunken preset list
+would otherwise leave orphaned entries behind. A part-written menu reports
+itself as disabled, so re-enabling it rewrites the whole list and repairs the
+gap.
+
+Uninstalling removes the keys too, from `src-tauri/nsis/hooks.nsh`, rather than
+by calling `unregister` — by uninstall time there may be no working copy of the
+app left to run it, and someone who never opened Settings would be left with the
+keys regardless. That means the extension list exists in two places, so tests in
+`shell_integration.rs` read the `.nsh` file and fail if the two drift apart; the
+failure mode otherwise is silent, a menu entry pointing at an executable that no
+longer exists. The hook assumes the per-user install NSIS defaults to: under
+`installMode: "perMachine"` the uninstaller runs elevated, `HKCU` resolves to the
+administrator's hive, and it would clean nothing.
+
 ---
 
 ## FFmpeg
@@ -240,51 +301,91 @@ after unpacking rather than left as another 90 MB of someone's disk.
 
 ## Releases and updating
 
-The app can update itself: it asks the release host what the newest version is
-and installs it, so nobody has to go and fetch an installer again. Every update
-must carry a signature made with this project's private key, and the matching
-public key is compiled into the binary — a compromised download host cannot push
-anything the app will accept.
+Nobody reinstalls this app to get a new version of it. A few seconds after
+launch it asks the release page whether anything newer exists; if so a one-line
+bar appears with the version number and a link to what changed. Clicking
+**Update** downloads the installer, runs it, and the app comes back on the new
+version. Nothing downloads before you say so, and the bar's **Update** button
+stays disabled while the queue is busy — installing closes the app, and losing
+a half-finished encode to a version bump is a bad trade.
 
-Publishing a release is a version bump and a tag:
+The launch check is one HTTPS request to the release page and can be turned off
+in Settings, where there is also a **Check now** button and the full release
+history.
+
+**Nothing is trusted because it came from the right URL.** Every installer is
+signed with a private key that lives on the maintainer's machine, and the
+matching public key is compiled into the app. A download whose signature does
+not verify is discarded rather than run — so a compromised release host, or
+anyone who talks the app into fetching from somewhere else, still cannot get a
+binary executed.
+
+### What's new
+
+`CHANGELOG.md` is compiled into the binary — `include_str!`, not a resource
+file, so it cannot go missing. On the first launch of a version you haven't
+seen, its entries are shown once. A fresh install shows nothing: a changelog is
+a poor greeting for someone who has never used the app.
+
+That same file is the source for the notes on the GitHub release and in the
+update prompt, lifted out by `pnpm notes` during the release build. Write
+entries for the person deciding whether to click Update, not for the commit
+log. Changes that have not shipped yet go under `## [Unreleased]`, which the
+app ignores until the heading becomes a version.
+
+### Cutting a release
 
 ```bash
-# The version in these three files is what the release actually contains.
-#   src-tauri/tauri.conf.json   ← the one that reaches latest.json
-#   src-tauri/Cargo.toml
-#   package.json
+pnpm version:set 0.2.0
+```
+
+That writes the version to `package.json`, `Cargo.toml`, `Cargo.lock` and
+`tauri.conf.json` together, and refuses to run without a changelog entry for it
+— rename `[Unreleased]` to the version first. The version in `tauri.conf.json`
+is the one that reaches `latest.json`, so the four have to agree. Then:
+
+```bash
 git commit -am "release v0.2.0"
 git tag v0.2.0 && git push origin main v0.2.0
 ```
 
-That triggers a workflow which builds the installer, signs it, and publishes a
-draft release including a `latest.json` describing the new version. Installed
-copies check that file and offer the update.
+That triggers a workflow which runs the tests, builds the installer, signs it,
+and creates a **draft** release with the changelog entry as its notes and a
+`latest.json` describing the new version. GitHub serves nothing from a draft
+until it is published from the Releases page. Once it is, installed copies find
+the `latest.json` and offer the update. Until then the in-app check reports that
+the server answered but had no release to offer, which is exactly right.
 
 The tag has to match the version in `tauri.conf.json`, and the workflow stops if
 it doesn't. That version — not the tag — is what `latest.json` advertises, so
 tagging `v0.2.0` on a tree still saying `0.1.0` would publish a release every
 installed copy reads as "nothing newer here". It is the one mistake this process
 can make silently, which is why it is checked rather than documented and hoped
-for.
+for. The workflow also refuses if the updater endpoint compiled into the app
+does not point at the repository doing the publishing — renaming the repository
+is cheap, and forgetting that URL would ship an app that quietly stops being
+offered updates.
 
 Running the workflow by hand from the Actions tab builds the installer without
-publishing anything, which is the way to check it works before committing to a
-tag.
+publishing anything, and keeps it as a downloadable artifact, which is the way
+to check it works — or to get a runnable build of any branch — before
+committing to a tag.
 
-**One thing must be true before the first release:**
+**One thing must be true before a release can be built:**
 
 The **`TAURI_SIGNING_PRIVATE_KEY` secret must be set** to the contents of the
 private key file, under Settings → Secrets and variables → Actions. The key
-lives outside this repository by design and must never be committed; losing it
-means existing installs can never be updated again, because they will reject
-anything signed with a different key.
+lives outside this repository by design and must never be committed. Back it up
+somewhere you will still have it in two years: losing it means every existing
+install is stranded, because a new key produces signatures old builds will
+correctly refuse, and the only way out is asking everyone to reinstall by hand.
 
 The repository also has to be public, so an installed copy can fetch
 `latest.json` without a login — that part is already done.
 
-Until the secret is set, the in-app check simply reports that it could not reach
-the update server, which is accurate and harmless.
+Until a release is published, the in-app check reports that the server answered
+but had no release to offer — the same thing it says while a release is still a
+draft — and Settings shows that message rather than guessing at a cause.
 
 **Update support only works forward.** A copy of the app can only update itself
 if the build the user installed already contained the updater. Anyone running a
@@ -294,12 +395,68 @@ build from before this was added has to install once manually.
 
 ## Development
 
-Requires Rust (stable), Node 20+, pnpm, and the MSVC C++ build tools on Windows.
+### Running it
+
+From inside the checkout — both commands need the project folder as the working
+directory, not your home folder:
 
 ```bash
+cd media-compressor
 pnpm install
 pnpm tauri dev
 ```
+
+That builds the Rust side, starts Vite, and opens the app. The first build takes
+several minutes because Rust compiles every dependency from scratch; after that
+it is seconds, and edits to the UI reload without a restart. Ctrl+C stops it.
+
+FFmpeg is not a prerequisite for running it — a debug build uses whatever is on
+PATH, and downloads its own if there is nothing there.
+
+### On a machine that has never built this
+
+Requires Rust (stable), Node 20+, pnpm 10.33+, and a C toolchain with the system
+webview headers. There is a script per platform that installs whatever of that
+is missing, then installs dependencies and starts the app.
+
+**Windows** — installs through winget, and additionally the MSVC C++ build tools
+and the WebView2 runtime:
+
+```powershell
+New-Item -ItemType Directory -Force -Path "$HOME\code" | Out-Null
+Set-Location "$HOME\code"
+git clone https://github.com/sak0x7d5/media-compressor.git
+Set-Location media-compressor
+powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
+```
+
+`-ExecutionPolicy Bypass` is for that one run only — Windows refuses unsigned
+scripts by default and this changes nothing permanently.
+
+**macOS and Linux** — Xcode command line tools on macOS, and the WebKitGTK
+development headers through apt, dnf or pacman on Linux:
+
+```bash
+mkdir -p ~/code && cd ~/code
+git clone https://github.com/sak0x7d5/media-compressor.git
+cd media-compressor
+./scripts/setup.sh
+```
+
+Either script skips anything already present, so re-running it is harmless.
+`-NoStart` (Windows) or `--no-start` (Unix) sets the machine up without
+launching anything.
+
+Two things they handle that are easy to hit by hand. The repository is private,
+so the clone asks you to sign in to GitHub. And a pnpm older than 10.33 rejects
+this project's `pnpm-workspace.yaml` — it holds settings rather than a workspace,
+so it has no `packages` field — which the scripts fix by upgrading, and, if an
+older copy still wins PATH, by calling the newer one directly and telling you
+where each one lives.
+
+Windows is the only platform the app is *released* for; the Mica window effect
+and the NSIS installer are Windows-only. It builds and runs on the other two for
+development.
 
 Tests:
 
@@ -313,13 +470,36 @@ process. The integration tests in `src-tauri/tests/end_to_end.rs` run real
 encodes; they generate their own source clips rather than checking a binary into
 the repo, and skip with a printed note when FFmpeg can't be found.
 
+Building an installer additionally needs a signing key. `createUpdaterArtifacts`
+is on and a public key is compiled into the binary, so Tauri refuses to produce
+updater artifacts it cannot sign — `pnpm tauri build` fails with "a public key
+has been found, but no private key" until one is present:
+
+```powershell
+pnpm tauri signer generate --ci -p "" -w "$env:USERPROFILE\.tauri\mc-dev.key"
+
+$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content "$env:USERPROFILE\.tauri\mc-dev.key" -Raw
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
+
+pnpm tauri build
+```
+
+A key generated this way does not match the public key compiled in, so the
+installer it produces can be installed by hand but can never be *offered* to an
+existing install as an update — which is exactly what a local build is for. The
+real key lives outside this repository and belongs only in CI. Neither key is
+ever committed; keeping the file outside the working tree is the simplest way to
+guarantee that.
+
 ```
 src-tauri/src/
 ├── strategy/       budget, resolution ladder, CRF-vs-two-pass decision (pure)
 ├── ffmpeg/         locating, acquiring, probing, encoding, sampling
 ├── images.rs       binary-search quality targeting
 ├── pipeline.rs     probe → plan → encode → verify → correct
-├── queue.rs        serial video, per-job cancellation
+├── queue.rs        serial video, pause/resume, per-job cancellation
+├── changelog.rs    CHANGELOG.md, compiled in and parsed (pure)
+├── updates.rs      self-updating, and which entries this profile has been shown
 └── commands.rs     the surface the UI calls
 ```
 

@@ -1,5 +1,6 @@
 //! The surface the frontend can call, and the events it receives back.
 
+use crate::changelog::{self, Release};
 use crate::clipboard;
 use crate::ffmpeg::acquire::{self, AcquireProgress};
 use crate::ffmpeg::encode::Speed;
@@ -11,11 +12,12 @@ use crate::presets::{self, PresetFile};
 use crate::preview::{self, PreviewPair};
 use crate::queue::{
     output_path_for, replacement_path_for, staging_path_for, Disposition, JobEvent, Queue,
-    QueueItem,
+    QueueItem, QueueStatus,
 };
 use crate::shell_integration;
 use crate::strategy::plan::Options;
 use crate::strategy::{MediaInfo, SharpnessBias, Target, VideoCodec};
+use crate::updates::{self, UpdatePrefs};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,8 +40,8 @@ pub struct AppState {
     pub cache_dir: PathBuf,
     pub config_dir: PathBuf,
     pub work_root: PathBuf,
-    /// Paths this process was launched with, consumed once by [`startup`].
-    pub pending_files: Mutex<Vec<String>>,
+    /// What this process was launched with, consumed once by [`startup`].
+    pub pending: Mutex<crate::Launch>,
     next_id: AtomicU64,
 }
 
@@ -80,9 +82,7 @@ impl AppState {
             cache_dir,
             config_dir,
             work_root,
-            pending_files: Mutex::new(crate::collect_file_args(
-                &std::env::args().collect::<Vec<_>>(),
-            )),
+            pending: Mutex::new(crate::parse_launch(&std::env::args().collect::<Vec<_>>())),
             next_id: AtomicU64::new(1),
         }
     }
@@ -124,10 +124,14 @@ impl FfmpegStatus {
 pub struct Startup {
     pub ffmpeg: FfmpegStatus,
     pub presets: PresetFile,
-    /// Paths this launch was handed on the command line — the Explorer context
-    /// menu on a cold start. Consumed here, so this is the only place that
-    /// will ever report them.
-    pub pending_files: Vec<String>,
+    /// What this launch was handed on the command line — the Explorer context
+    /// menu on a cold start, and the size its submenu entry stands for.
+    /// Consumed here, so this is the only place that will ever report it.
+    pub launch: crate::Launch,
+    /// Whether this build can offer the Explorer entry at all. A constant, so it
+    /// rides along for free; the first-run screen needs it for its checkbox
+    /// before anything else has been asked.
+    pub shell_supported: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -213,7 +217,9 @@ pub fn list_presets(state: State<'_, AppState>) -> PresetFile {
 
 #[tauri::command]
 pub fn save_presets(state: State<'_, AppState>, presets: PresetFile) -> Result<(), String> {
-    crate::presets::save(&state.config_dir, &presets).map_err(|e| e.to_string())
+    crate::presets::save(&state.config_dir, &presets).map_err(|e| e.to_string())?;
+    resync_shell_menu(&state.config_dir);
+    Ok(())
 }
 
 /// Point the app at a URL to keep the preset list current, or `None` to stop.
@@ -235,6 +241,7 @@ pub fn set_presets_url(state: State<'_, AppState>, url: Option<String>) -> Resul
     // Changing the source invalidates when we last checked it.
     presets.last_refreshed = None;
     presets::save(&state.config_dir, &presets).map_err(|e| e.to_string())?;
+    resync_shell_menu(&state.config_dir);
 
     Ok(presets)
 }
@@ -243,9 +250,19 @@ pub fn set_presets_url(state: State<'_, AppState>, url: Option<String>) -> Resul
 #[tauri::command]
 pub async fn refresh_presets(app: AppHandle, force: bool) -> Result<Option<PresetFile>, String> {
     let config_dir = app.state::<AppState>().config_dir.clone();
-    tauri::async_runtime::spawn_blocking(move || presets::refresh(&config_dir, force))
-        .await
-        .map_err(|e| format!("refresh task failed: {e}"))?
+    let refreshed = tauri::async_runtime::spawn_blocking(move || {
+        let result = presets::refresh(&config_dir, force);
+        // A refresh that changed the list must change the menu with it, or the
+        // right-click sizes silently drift from the ones the app offers.
+        if matches!(result, Ok(Some(_))) {
+            resync_shell_menu(&config_dir);
+        }
+        result
+    })
+    .await
+    .map_err(|e| format!("refresh task failed: {e}"))?;
+
+    refreshed
 }
 
 /// The located binaries, or the error the frontend shows when there are none.
@@ -426,6 +443,10 @@ pub async fn probe_file(app: AppHandle, path: String) -> Result<MediaInfo, Strin
 }
 
 /// Queue one or more files for compression.
+///
+/// Adding files also sets a paused queue going again. Dropping a file in is an
+/// unambiguous "do this", and a queue that accepted it and then sat on it would
+/// look broken — the pause was about the work in front of it, not a mode.
 #[tauri::command]
 pub fn add_files(
     state: State<'_, AppState>,
@@ -528,6 +549,10 @@ pub fn add_files(
         queued.push(summary);
     }
 
+    if !queued.is_empty() {
+        state.queue.resume();
+    }
+
     queued
 }
 
@@ -536,9 +561,23 @@ pub fn cancel_job(state: State<'_, AppState>, id: String) {
     state.queue.cancel(&id);
 }
 
+/// Throw the whole queue away. Returns the state it left behind so the footer
+/// does not have to assume what clearing did.
 #[tauri::command]
-pub fn cancel_all(state: State<'_, AppState>) {
+pub fn cancel_all(state: State<'_, AppState>) -> QueueStatus {
     state.queue.cancel_all();
+    state.queue.status()
+}
+
+/// Stop working without losing the queue. See `Queue::pause`.
+#[tauri::command]
+pub fn pause_queue(state: State<'_, AppState>) -> QueueStatus {
+    state.queue.pause()
+}
+
+#[tauri::command]
+pub fn resume_queue(state: State<'_, AppState>) -> QueueStatus {
+    state.queue.resume()
 }
 
 #[tauri::command]
@@ -572,11 +611,110 @@ pub async fn preview_pair(
     .await
 }
 
+/// The changelog entries this profile has not been shown yet.
+#[derive(Debug, Clone, Serialize)]
+pub struct WhatsNew {
+    /// The version they were on. `None` never reaches the frontend — a profile
+    /// with nothing recorded is shown nothing.
+    pub from: Option<String>,
+    pub current: String,
+    pub releases: Vec<Release>,
+}
+
+/// What changed since this profile last ran.
+///
+/// Returns `None` on a fresh install, on an unchanged version, and on a
+/// downgrade — and in the first of those cases quietly records the current
+/// version, so the *next* update has something to measure against. Without
+/// that, a new install would never see release notes again.
+#[tauri::command]
+pub fn whats_new(app: AppHandle, state: State<'_, AppState>) -> Option<WhatsNew> {
+    let current = app.package_info().version.to_string();
+    let prefs = updates::load(&state.config_dir);
+
+    let releases = updates::unseen(prefs.last_seen_version.as_deref(), &current, &changelog::releases());
+    if releases.is_empty() {
+        // Nothing to say, so the bookmark can move now rather than waiting on a
+        // panel the user is never going to see.
+        mark_seen(&state.config_dir, &current);
+        return None;
+    }
+
+    Some(WhatsNew { from: prefs.last_seen_version, current, releases })
+}
+
+/// Acknowledge the What's new panel.
+///
+/// Deliberately separate from reading it: quitting without closing the panel
+/// should leave the notes waiting next launch, not swallow them.
+#[tauri::command]
+pub fn dismiss_whats_new(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let current = app.package_info().version.to_string();
+    updates::save(
+        &state.config_dir,
+        &UpdatePrefs { last_seen_version: Some(current), ..updates::load(&state.config_dir) },
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn mark_seen(config_dir: &std::path::Path, version: &str) {
+    let prefs = updates::load(config_dir);
+    if prefs.last_seen_version.as_deref() == Some(version) {
+        return;
+    }
+    // A profile directory that cannot be written is not worth failing a launch
+    // over; the cost is being told about this version again next time.
+    let _ = updates::save(
+        config_dir,
+        &UpdatePrefs { last_seen_version: Some(version.to_string()), ..prefs },
+    );
+}
+
+/// The full release history, compiled into the binary. Needs no network.
+#[tauri::command]
+pub fn changelog() -> Vec<Release> {
+    changelog::releases()
+}
+
+#[tauri::command]
+pub fn update_prefs(state: State<'_, AppState>) -> UpdatePrefs {
+    updates::load(&state.config_dir)
+}
+
+/// Turn the check-on-launch behaviour on or off.
+#[tauri::command]
+pub fn set_auto_check(state: State<'_, AppState>, enabled: bool) -> Result<UpdatePrefs, String> {
+    let prefs = UpdatePrefs { auto_check: enabled, ..updates::load(&state.config_dir) };
+    updates::save(&state.config_dir, &prefs).map_err(|e| e.to_string())?;
+    Ok(prefs)
+}
+
+/// The state of the Explorer right-click entry.
+///
+/// `supported` and `enabled` travel together because the UI needs both to
+/// decide anything: an unsupported platform hides the control rather than
+/// showing one that can only fail.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ShellMenuStatus {
+    pub supported: bool,
+    pub enabled: bool,
+}
+
+fn shell_menu_snapshot() -> ShellMenuStatus {
+    ShellMenuStatus {
+        supported: shell_integration::is_supported(),
+        enabled: shell_integration::is_registered(),
+    }
+}
+
 /// Reads the registry, so it runs off the UI thread like everything else that
 /// touches the outside world.
 #[tauri::command]
-pub async fn shell_menu_status() -> bool {
-    tauri::async_runtime::spawn_blocking(shell_integration::is_registered).await.unwrap_or(false)
+pub async fn shell_menu_status() -> ShellMenuStatus {
+    tauri::async_runtime::spawn_blocking(shell_menu_snapshot).await.unwrap_or(ShellMenuStatus {
+        supported: shell_integration::is_supported(),
+        enabled: false,
+    })
 }
 
 /// Everything the first frame needs, in a single round trip.
@@ -593,7 +731,8 @@ pub fn startup(state: State<'_, AppState>) -> Startup {
     Startup {
         ffmpeg: FfmpegStatus::of(state.tools.lock().unwrap().as_ref()),
         presets: presets::load(&state.config_dir),
-        pending_files: std::mem::take(&mut *state.pending_files.lock().unwrap()),
+        launch: std::mem::take(&mut *state.pending.lock().unwrap()),
+        shell_supported: shell_integration::is_supported(),
     }
 }
 
@@ -613,16 +752,38 @@ pub fn ui_ready(app: AppHandle) {
 ///
 /// Writes only under HKEY_CURRENT_USER, so this never needs administrator
 /// rights and never affects other accounts on the machine.
+///
+/// The returned status is read back from the registry rather than echoing the
+/// requested value, so a write that half-succeeded reports itself as off.
 #[tauri::command]
-pub fn set_shell_menu(enabled: bool) -> Result<bool, String> {
+pub fn set_shell_menu(state: State<'_, AppState>, enabled: bool) -> Result<ShellMenuStatus, String> {
     let result = if enabled {
-        shell_integration::register()
+        let presets = presets::load(&state.config_dir);
+        shell_integration::register(&presets.shell_menu())
     } else {
         shell_integration::unregister()
     };
 
     result.map_err(|e| e.to_string())?;
-    Ok(shell_integration::is_registered())
+    Ok(shell_menu_snapshot())
+}
+
+/// Rewrite the submenu to match the current presets and executable.
+///
+/// Silent by design, and a no-op unless the menu is currently registered: a
+/// preset edit should not start writing to the registry for someone who never
+/// asked for the Explorer entry, and a failure here must not fail the edit.
+///
+/// Also run once at startup. The command line embeds this executable's absolute
+/// path, and the menu's shape changes between versions, so an install that
+/// moved or upgraded would otherwise keep the old layout — or point at a path
+/// that no longer exists — until someone thought to toggle Settings off and on.
+pub(crate) fn resync_shell_menu(config_dir: &std::path::Path) {
+    if !shell_integration::is_registered() {
+        return;
+    }
+    let presets = presets::load(config_dir);
+    let _ = shell_integration::register(&presets.shell_menu());
 }
 
 #[cfg(test)]
